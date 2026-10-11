@@ -5,9 +5,9 @@
 #pragma once
 
 #include <workerd/io/worker-interface.h>
-#include <workerd/server/lua-runtime.h>
+#include <workerd/rt/luajit/lua-runtime.h>
 
-namespace workerd::server {
+namespace workerd::rt::luajit {
 
 class LuaWorkerInterface final: public WorkerInterface {
  public:
@@ -32,4 +32,4 @@ class LuaWorkerInterface final: public WorkerInterface {
   LuaRuntime& runtime;
 };
 
-}  // namespace workerd::server
+}  // namespace workerd::rt::luajit

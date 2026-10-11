@@ -813,7 +813,7 @@ KJ_TEST("Server: serve basic Service Worker") {
 
 KJ_TEST("Server: serve LuaJIT HTTP worker selected from config") {
   TestServer test(singleWorker(R"((
-    luaScript = "return { fetch = function(request) return { status = 202, headers = {{ name = 'Content-Type', value = 'text/plain;charset=UTF-8' }}, body = 'lua:' .. request.url } end }"
+    luaScript = "return { fetch = function(request) workerd.sleep(1); return { status = 202, headers = {{ name = 'Content-Type', value = 'text/plain;charset=UTF-8' }}, body = 'lua:' .. request.url } end }"
   ))"_kj));
 
   test.server.allowExperimental();
@@ -821,6 +821,7 @@ KJ_TEST("Server: serve LuaJIT HTTP worker selected from config") {
 
   auto conn = test.connect("test-addr");
   conn.sendHttpGet("/lua");
+  test.wait(1);
   conn.recv("HTTP/1.1 202 LuaJIT\n"
             "Content-Length: 18\n"
             "Content-Type: text/plain;charset=UTF-8\n"

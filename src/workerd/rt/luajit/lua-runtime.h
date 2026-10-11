@@ -5,8 +5,10 @@
 #pragma once
 
 #include <kj/array.h>
+#include <kj/async.h>
 #include <kj/compat/http.h>
 #include <kj/string.h>
+#include <kj/timer.h>
 #include <kj/vector.h>
 
 #include <cstddef>
@@ -14,7 +16,7 @@
 
 struct lua_State;
 
-namespace workerd::server {
+namespace workerd::rt::luajit {
 
 class LuaRuntime final {
  public:
@@ -33,21 +35,21 @@ class LuaRuntime final {
   static constexpr size_t MAX_HTTP_HEADERS = 128;
 
   // The module must return a table with a callable `fetch` field. This runtime owns one LuaJIT
-  // state for its lifetime; calls to fetch() are synchronous and must be serialized.
-  explicit LuaRuntime(kj::StringPtr moduleSource);
+  // state for its lifetime; each fetch() runs on a coroutine and yields only through host async
+  // operations. Coroutine access to the shared state is serialized on the event-loop thread.
+  LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer);
   ~LuaRuntime() noexcept;
   KJ_DISALLOW_COPY_AND_MOVE(LuaRuntime);
 
-  Response fetch(kj::StringPtr method,
+  kj::Promise<Response> fetch(kj::StringPtr method,
       kj::StringPtr url,
       const kj::HttpHeaders& headers,
       kj::ArrayPtr<const kj::byte> body);
 
  private:
+  kj::Timer& timer;
   lua_State* state;
   int fetchHandlerRef;
-
-  void requireCallSucceeded(kj::StringPtr operation);
 };
 
-}  // namespace workerd::server
+}  // namespace workerd::rt::luajit

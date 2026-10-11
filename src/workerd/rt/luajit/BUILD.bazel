@@ -1,0 +1,23 @@
+load("//:build/kj_test.bzl", "kj_test")
+load("//:build/wd_cc_library.bzl", "wd_cc_library")
+
+wd_cc_library(
+    name = "luajit-runtime",
+    srcs = ["lua-runtime.c++"],
+    hdrs = [
+        "lua-runtime.h",
+        "lua-worker-interface.h",
+    ],
+    visibility = ["//src/workerd/server:__pkg__"],
+    deps = [
+        "//src/workerd/io:worker-interface",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj/compat:kj-http",
+        "@luajit",
+    ],
+)
+
+kj_test(
+    src = "lua-runtime-test.c++",
+    deps = [":luajit-runtime"],
+)

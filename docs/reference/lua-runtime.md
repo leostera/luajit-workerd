@@ -19,7 +19,7 @@ Start the server with `workerd serve config.capnp --experimental`.
 
 ## Lua module contract
 
-`worker.lua` is evaluated once when the worker service is constructed. It must return a table with a synchronous `fetch(request)` function:
+`worker.lua` is evaluated once when the worker service is constructed. It must return a table with a `fetch(request)` function. The function may suspend at supported host operations and then continue with the result:
 
 ```lua
 return {
@@ -35,6 +35,8 @@ return {
 }
 ```
 
+A handler can call `workerd.sleep(milliseconds)` to suspend for a timer delay from 0 through 4,294,967,295 milliseconds. This yields the request coroutine without blocking the workerd event loop; no other asynchronous host operations are available yet.
+
 The request table contains:
 
 - `method`: the HTTP method string.
@@ -44,22 +46,22 @@ The request table contains:
 
 The response must be a table with an integer `status` from 200 through 599 and a string `body`. It may include `headers`, an array of `{ name, value }` string tables. Response header names and values are validated by workerd's HTTP header implementation. Handler exceptions, invalid module results, and invalid response fields fail the request; they are not converted into successful responses. The HTTP reason phrase is `LuaJIT` for every response; clients should use the numeric status code.
 
-One LuaJIT state is owned by each configured Lua worker service. The module is evaluated once and Lua globals persist across that service's HTTP requests, but state is neither shared with another worker service nor persisted across process restarts. Handlers run synchronously on the workerd request path. Request and response bodies are limited to 1 MiB each, and each header list is limited to 128 entries.
+One LuaJIT state is owned by each configured Lua worker service. The module is evaluated once and Lua globals persist across that service's HTTP requests, but state is neither shared with another worker service nor persisted across process restarts. Each request runs in its own Lua coroutine. The current host async operation is `workerd.sleep(milliseconds)`, which suspends that request without blocking other requests; handlers can share and interleave access to Lua globals across such suspension points. Ordinary Lua code remains synchronous and runs on the workerd event-loop thread. Request and response bodies are limited to 1 MiB each, and each header list is limited to 128 entries.
 
 ## Supported scope and limitations
 
-The Lua backend does not implement JavaScript, Web APIs, Node.js APIs, or the JSG interface. It does not support worker bindings, custom outbound services, compatibility dates or flags, Durable Objects, Workflows, Cache API outbound bindings, module fallback, tail workers, containers, Access bindings, RPC, scheduled events, alarms, HTTP CONNECT, or WebSockets. Unsupported worker configuration is rejected during service construction; unsupported request/event methods fail explicitly.
+The Lua backend does not implement JavaScript, Web APIs, Node.js APIs, or the JSG interface. Beyond `workerd.sleep(milliseconds)`, it has no asynchronous host APIs yet. It does not support worker bindings, custom outbound services, compatibility dates or flags, Durable Objects, Workflows, Cache API outbound bindings, module fallback, tail workers, containers, Access bindings, RPC, scheduled events, alarms, HTTP CONNECT, or WebSockets. Unsupported worker configuration is rejected during service construction; unsupported request/event methods fail explicitly.
 
-LuaJIT is not a sandbox. The runtime opens Lua's standard libraries, including operating-system, filesystem, package-loading, and native-library facilities. Lua source must be trusted. There is no instruction, CPU-time, or memory limit; synchronous Lua code can block the request event loop. Do not use this backend for tenant-controlled or otherwise untrusted code.
+LuaJIT is not a sandbox. The runtime opens Lua's standard libraries, including operating-system, filesystem, package-loading, and native-library facilities. Lua source must be trusted. There is no instruction, CPU-time, or memory limit; synchronous Lua code can block the request event loop, even though `workerd.sleep()` can yield while waiting for a timer. Do not use this backend for tenant-controlled or otherwise untrusted code.
 
 ## Tests
 
-The runtime unit test covers HTTP data conversion, independent states, invalid modules and handler results, and unsupported scheduled/alarm events. The server test exercises config selection and an HTTP request through workerd's service path, and includes the unchanged V8 service-worker path as a regression check:
+The runtime unit test covers HTTP data conversion, coroutine suspension/resumption, independent states, invalid modules and handler results, and unsupported scheduled/alarm events. The server test exercises config selection and an HTTP request that suspends through `workerd.sleep()`, and includes the unchanged V8 service-worker path as a regression check:
 
 On macOS arm64 with Bazel 9.2.0, the workerd binary and both focused test targets built successfully; both test targets passed. This checkout's JVM trust store could not validate `https://bcr.bazel.build/`, so the commands below used the raw GitHub mirror of the Bazel Central Registry:
 
 ```sh
 bazel build --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/server:workerd
-bazel test --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/server:lua-runtime-test@
+bazel test --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/rt/luajit:lua-runtime-test@
 bazel test --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/server:server-test@
 ```

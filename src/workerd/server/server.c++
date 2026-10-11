@@ -6,8 +6,6 @@
 
 #include "alarm-scheduler.h"
 #include "container-client.h"
-#include "lua-runtime.h"
-#include "lua-worker-interface.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -34,6 +32,8 @@
 #include <workerd/io/worker-fs.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/io/worker.h>
+#include <workerd/rt/luajit/lua-runtime.h>
+#include <workerd/rt/luajit/lua-worker-interface.h>
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/facet-tree-index.h>
 #include <workerd/server/fallback-service.h>
@@ -2069,12 +2069,12 @@ class Server::InvalidConfigService final: public Service {
 
 class Server::LuaWorkerService final: public Service {
  public:
-  LuaWorkerService(kj::StringPtr name, kj::StringPtr source)
+  LuaWorkerService(kj::StringPtr name, kj::StringPtr source, kj::Timer& timer)
       : name(kj::str(name)),
-        runtime(kj::heap<LuaRuntime>(source)) {}
+        runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer)) {}
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
-    return kj::heap<LuaWorkerInterface>(*runtime);
+    return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(*runtime);
   }
 
   bool hasHandler(kj::StringPtr handlerName) override {
@@ -2092,7 +2092,7 @@ class Server::LuaWorkerService final: public Service {
 
  private:
   kj::String name;
-  kj::Own<LuaRuntime> runtime;
+  kj::Own<::workerd::rt::luajit::LuaRuntime> runtime;
 };
 
 class Server::InvalidConfigActorClass final: public ActorClass {
@@ -5818,7 +5818,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 
     kj::Maybe<kj::Own<Service>> luaService = kj::none;
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
-      luaService = kj::refcounted<LuaWorkerService>(name, conf.getLuaScript());
+      luaService = kj::refcounted<LuaWorkerService>(name, conf.getLuaScript(), timer);
     })) {
       errorReporter.addError(
           kj::str("LuaJIT worker \"", name, "\" failed to initialize: ", exception));

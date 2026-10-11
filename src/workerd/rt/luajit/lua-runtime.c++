@@ -12,8 +12,26 @@
 
 #include <cstring>
 
-namespace workerd::server {
+namespace workerd::rt::luajit {
 namespace {
+
+constexpr char ASYNC_API_SOURCE[] = R"lua(
+workerd = {}
+
+function workerd.await(operation)
+  local succeeded, value = coroutine.yield(operation)
+  if not succeeded then error(value, 2) end
+  return value
+end
+
+function workerd.sleep(milliseconds)
+  if type(milliseconds) ~= "number" or milliseconds ~= math.floor(milliseconds) or
+      milliseconds < 0 or milliseconds > 4294967295 then
+    error("workerd.sleep() requires an integer duration from 0 through 4294967295 milliseconds", 2)
+  end
+  return workerd.await({ operation = "sleep", milliseconds = milliseconds })
+end
+)lua";
 
 class LuaStackGuard final {
  public:
@@ -72,6 +90,29 @@ void pushRequestHeaders(lua_State* state, const kj::HttpHeaders& headers) {
   });
 }
 
+kj::Duration readSleepDelay(lua_State* state) {
+  KJ_REQUIRE(lua_gettop(state) == 1, "LuaJIT host operation must yield one descriptor");
+  KJ_REQUIRE(lua_istable(state, -1), "LuaJIT host operation descriptor must be a table");
+
+  getRawField(state, -1, "operation");
+  size_t operationLength = 0;
+  const char* operation = lua_tolstring(state, -1, &operationLength);
+  bool isSleep = operation != nullptr && kj::StringPtr(operation, operationLength) == "sleep";
+  lua_pop(state, 1);
+  KJ_REQUIRE(isSleep, "unsupported LuaJIT host operation");
+
+  getRawField(state, -1, "milliseconds");
+  int isNumber = 0;
+  lua_Integer milliseconds = lua_tointegerx(state, -1, &isNumber);
+  bool validDuration = lua_type(state, -1) == LUA_TNUMBER && isNumber && milliseconds >= 0 &&
+      static_cast<uint64_t>(milliseconds) <= UINT32_MAX &&
+      static_cast<lua_Number>(milliseconds) == lua_tonumber(state, -1);
+  lua_pop(state, 1);
+  KJ_REQUIRE(validDuration, "workerd.sleep() requires an integer duration from 0 through",
+      UINT32_MAX, "milliseconds");
+  return static_cast<uint32_t>(milliseconds) * kj::MILLISECONDS;
+}
+
 kj::Vector<LuaRuntime::Header> readResponseHeaders(lua_State* state, int tableIndex) {
   tableIndex = absoluteIndex(state, tableIndex);
   KJ_REQUIRE(lua_istable(state, tableIndex), "Lua response.headers must be an array");
@@ -94,8 +135,9 @@ kj::Vector<LuaRuntime::Header> readResponseHeaders(lua_State* state, int tableIn
 
 }  // namespace
 
-LuaRuntime::LuaRuntime(kj::StringPtr moduleSource)
-    : state(luaL_newstate()),
+LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer)
+    : timer(timer),
+      state(luaL_newstate()),
       fetchHandlerRef(LUA_NOREF) {
   KJ_REQUIRE(state != nullptr, "could not create LuaJIT state");
   bool keepState = false;
@@ -104,6 +146,14 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource)
   // This is an experimental trusted-code runtime, not a sandbox. The standard libraries include
   // operating-system and native-library access.
   luaL_openlibs(state);
+  int asyncApiLoadStatus =
+      luaL_loadbuffer(state, ASYNC_API_SOURCE, sizeof(ASYNC_API_SOURCE) - 1, "workerd-async.lua");
+  KJ_REQUIRE(
+      asyncApiLoadStatus == 0, "failed to compile LuaJIT async API:", readLuaErrorMessage(state));
+  int asyncApiEvaluationStatus = lua_pcall(state, 0, 0, 0);
+  KJ_REQUIRE(asyncApiEvaluationStatus == 0,
+      "failed to evaluate LuaJIT async API:", readLuaErrorMessage(state));
+
   int loadStatus = luaL_loadbuffer(state, moduleSource.begin(), moduleSource.size(), "worker.lua");
   if (loadStatus != 0) {
     KJ_FAIL_REQUIRE("failed to compile LuaJIT module:", readLuaErrorMessage(state));
@@ -125,12 +175,7 @@ LuaRuntime::~LuaRuntime() noexcept {
   if (state != nullptr) lua_close(state);
 }
 
-void LuaRuntime::requireCallSucceeded(kj::StringPtr operation) {
-  if (lua_pcall(state, 1, 1, 0) == 0) return;
-  KJ_FAIL_REQUIRE("LuaJIT", operation, "failed:", readLuaErrorMessage(state));
-}
-
-LuaRuntime::Response LuaRuntime::fetch(kj::StringPtr method,
+kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
     kj::StringPtr url,
     const kj::HttpHeaders& headers,
     kj::ArrayPtr<const kj::byte> body) {
@@ -140,32 +185,52 @@ LuaRuntime::Response LuaRuntime::fetch(kj::StringPtr method,
       headers.size() <= MAX_HTTP_HEADERS, "LuaJIT request has too many headers", MAX_HTTP_HEADERS);
 
   LuaStackGuard stackGuard(state);
-  lua_rawgeti(state, LUA_REGISTRYINDEX, fetchHandlerRef);
-  lua_createtable(state, 0, 4);
-  setStringField(state, "method", method);
-  setStringField(state, "url", url);
+  lua_State* coroutine = lua_newthread(state);
+  int coroutineRef = luaL_ref(state, LUA_REGISTRYINDEX);
+  KJ_DEFER(luaL_unref(state, LUA_REGISTRYINDEX, coroutineRef));
 
-  lua_pushlstring(state, reinterpret_cast<const char*>(body.begin()), body.size());
-  lua_setfield(state, -2, "body");
+  lua_rawgeti(coroutine, LUA_REGISTRYINDEX, fetchHandlerRef);
+  lua_createtable(coroutine, 0, 4);
+  setStringField(coroutine, "method", method);
+  setStringField(coroutine, "url", url);
 
-  pushRequestHeaders(state, headers);
-  lua_setfield(state, -2, "headers");
+  lua_pushlstring(coroutine, reinterpret_cast<const char*>(body.begin()), body.size());
+  lua_setfield(coroutine, -2, "body");
 
-  requireCallSucceeded("fetch()");
-  KJ_REQUIRE(lua_istable(state, -1), "LuaJIT fetch() must return a response table");
-  int responseIndex = absoluteIndex(state, -1);
+  pushRequestHeaders(coroutine, headers);
+  lua_setfield(coroutine, -2, "headers");
 
-  getRawField(state, responseIndex, "status");
+  int status = lua_resume(coroutine, 1);
+  while (status == LUA_YIELD) {
+    auto delay = readSleepDelay(coroutine);
+    lua_settop(coroutine, 0);
+
+    try {
+      co_await timer.afterDelay(delay);
+      lua_pushboolean(coroutine, 1);
+      lua_pushboolean(coroutine, 1);
+    } catch (const kj::Exception& exception) {
+      auto description = exception.getDescription();
+      lua_pushboolean(coroutine, 0);
+      lua_pushlstring(coroutine, description.begin(), description.size());
+    }
+    status = lua_resume(coroutine, 2);
+  }
+  KJ_REQUIRE(status == 0, "LuaJIT fetch() failed:", readLuaErrorMessage(coroutine));
+  KJ_REQUIRE(lua_istable(coroutine, -1), "LuaJIT fetch() must return a response table");
+  int responseIndex = absoluteIndex(coroutine, -1);
+
+  getRawField(coroutine, responseIndex, "status");
   int isNumber = 0;
-  lua_Integer luaStatus = lua_tointegerx(state, -1, &isNumber);
-  bool validStatus = lua_type(state, -1) == LUA_TNUMBER && isNumber && luaStatus >= 200 &&
-      luaStatus <= 599 && static_cast<lua_Number>(luaStatus) == lua_tonumber(state, -1);
+  lua_Integer luaStatus = lua_tointegerx(coroutine, -1, &isNumber);
+  bool validStatus = lua_type(coroutine, -1) == LUA_TNUMBER && isNumber && luaStatus >= 200 &&
+      luaStatus <= 599 && static_cast<lua_Number>(luaStatus) == lua_tonumber(coroutine, -1);
   if (!validStatus) {
     KJ_FAIL_REQUIRE("LuaJIT response.status must be an integer from 200 through 599");
   }
-  lua_pop(state, 1);
+  lua_pop(coroutine, 1);
 
-  auto responseBody = readStringField(state, responseIndex, "body");
+  auto responseBody = readStringField(coroutine, responseIndex, "body");
   KJ_REQUIRE(responseBody.size() <= MAX_HTTP_BODY_BYTES, "LuaJIT response body exceeds limit",
       MAX_HTTP_BODY_BYTES);
   auto bodyBytes = kj::heapArray<kj::byte>(responseBody.size());
@@ -174,13 +239,13 @@ LuaRuntime::Response LuaRuntime::fetch(kj::StringPtr method,
   }
 
   kj::Vector<Header> responseHeaders;
-  getRawField(state, responseIndex, "headers");
-  if (!lua_isnil(state, -1)) {
-    responseHeaders = readResponseHeaders(state, -1);
+  getRawField(coroutine, responseIndex, "headers");
+  if (!lua_isnil(coroutine, -1)) {
+    responseHeaders = readResponseHeaders(coroutine, -1);
   }
-  lua_pop(state, 1);
+  lua_pop(coroutine, 1);
 
-  return Response{
+  co_return Response{
     .status = static_cast<uint16_t>(luaStatus),
     .headers = kj::mv(responseHeaders),
     .body = kj::mv(bodyBytes),
@@ -216,7 +281,7 @@ kj::Promise<void> LuaWorkerInterface::request(kj::HttpMethod method,
   auto responseHeaders = requestHeaders.cloneShallow();
   responseHeaders.clear();
   auto body = co_await requestBody.readAllBytes(LuaRuntime::MAX_HTTP_BODY_BYTES);
-  auto result = runtime.fetch(methodName, urlCopy, requestHeaders, body);
+  auto result = co_await runtime.fetch(methodName, urlCopy, requestHeaders, body);
 
   for (auto& header: result.headers) {
     responseHeaders.add(kj::mv(header.name), kj::mv(header.value));
@@ -257,4 +322,4 @@ kj::Promise<WorkerInterface::CustomEvent::Result> LuaWorkerInterface::customEven
   return event->notSupported();
 }
 
-}  // namespace workerd::server
+}  // namespace workerd::rt::luajit
