@@ -343,6 +343,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class ExternalTcpService;
   class NetworkService;
   class DiskDirectoryService;
+  class LuaWorkerService;
   class WorkerService;
   class WorkerEntrypointService;
   class WorkerdBootstrapImpl;

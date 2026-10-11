@@ -323,6 +323,11 @@ struct Worker {
     # the bindings. (When using service workers syntax, the global scope contains the bindings;
     # in this case each derived worker runs in its own global scope, though still in the same
     # isolate.)
+
+    luaScript @21 :Text;
+    # Experimental HTTP-only LuaJIT worker source. When using Cap'n Proto text format, use the
+    # `embed` directive to read the source from an external file. LuaJIT workers are intended only
+    # for trusted source and do not provide a security boundary.
   }
 
   struct Module {

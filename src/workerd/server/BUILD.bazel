@@ -264,6 +264,21 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "lua-runtime",
+    srcs = ["lua-runtime.c++"],
+    hdrs = [
+        "lua-runtime.h",
+        "lua-worker-interface.h",
+    ],
+    deps = [
+        "//src/workerd/io:worker-interface",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj/compat:kj-http",
+        "@luajit",
+    ],
+)
+
+wd_cc_library(
     name = "workerd-api",
     srcs = [
         "workerd-api.c++",
@@ -346,6 +361,7 @@ wd_cc_library(
         ":container-client",
         ":facet-tree-index",
         ":fallback-service",
+        ":lua-runtime",
         ":workerd-api",
         ":workerd_capnp",
         "//src/cloudflare",
@@ -468,6 +484,11 @@ wd_capnp_library(
         "//src/workerd/api:__pkg__",
         "//src/workerd/tests:__pkg__",
     ],
+)
+
+kj_test(
+    src = "lua-runtime-test.c++",
+    deps = [":lua-runtime"],
 )
 
 kj_test(

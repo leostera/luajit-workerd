@@ -6,6 +6,8 @@
 
 #include "alarm-scheduler.h"
 #include "container-client.h"
+#include "lua-runtime.h"
+#include "lua-worker-interface.h"
 #include "pyodide.h"
 #include "workerd-api.h"
 
@@ -2063,6 +2065,34 @@ class Server::InvalidConfigService final: public Service {
     // Can't get here because workerd would have failed to start.
     KJ_UNREACHABLE;
   }
+};
+
+class Server::LuaWorkerService final: public Service {
+ public:
+  LuaWorkerService(kj::StringPtr name, kj::StringPtr source)
+      : name(kj::str(name)),
+        runtime(kj::heap<LuaRuntime>(source)) {}
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    return kj::heap<LuaWorkerInterface>(*runtime);
+  }
+
+  bool hasHandler(kj::StringPtr handlerName) override {
+    return handlerName == "fetch";
+  }
+
+  void requireAllowsTransfer() override {
+    KJ_FAIL_REQUIRE("LuaJIT workers cannot be serialized or transferred over RPC", name);
+  }
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    KJ_FAIL_REQUIRE("LuaJIT workers cannot be serialized or transferred over RPC", name);
+  }
+
+ private:
+  kj::String name;
+  kj::Own<LuaRuntime> runtime;
 };
 
 class Server::InvalidConfigActorClass final: public ActorClass {
@@ -5751,6 +5781,55 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 
   ConfigErrorReporter errorReporter(*this, name);
 
+  if (conf.isLuaScript()) {
+    bool unsupportedConfig = false;
+    auto rejectIf = [&](bool configured, kj::StringPtr feature) {
+      if (!configured) return;
+      unsupportedConfig = true;
+      errorReporter.addError(
+          kj::str("LuaJIT worker \"", name, "\" does not support ", feature, "."));
+    };
+
+    if (!experimental) {
+      unsupportedConfig = true;
+      errorReporter.addError(
+          kj::str("LuaJIT workers are experimental; run workerd with `--experimental`."));
+    }
+    rejectIf(conf.getBindings().size() != 0, "bindings");
+    rejectIf(conf.hasCompatibilityDate() || conf.getCompatibilityFlags().size() != 0,
+        "compatibility dates and flags");
+    auto outbound = conf.getGlobalOutbound();
+    rejectIf(outbound.getName() != "internet" || outbound.hasEntrypoint() ||
+            !outbound.getProps().isEmpty(),
+        "custom outbound services");
+    rejectIf(conf.getDurableObjectNamespaces().size() != 0 ||
+            conf.getDurableObjectStorage().which() != config::Worker::DurableObjectStorage::NONE ||
+            conf.hasDurableObjectUniqueKeyModifier(),
+        "Durable Objects");
+    rejectIf(conf.hasWorkflowsEngine(), "Workflows");
+    rejectIf(conf.getTails().size() != 0 || conf.getStreamingTails().size() != 0, "tail workers");
+    rejectIf(conf.hasModuleFallback(), "module fallback");
+    rejectIf(conf.hasAccessBlobHeader() || conf.hasAccessBindingService(), "Access bindings");
+    rejectIf(conf.hasCacheApiOutbound(), "Cache API outbound bindings");
+    rejectIf(conf.getContainerEngine().which() != config::Worker::ContainerEngine::NONE,
+        "container engines");
+
+    if (unsupportedConfig) co_return makeInvalidConfigService();
+
+    kj::Maybe<kj::Own<Service>> luaService = kj::none;
+    KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+      luaService = kj::refcounted<LuaWorkerService>(name, conf.getLuaScript());
+    })) {
+      errorReporter.addError(
+          kj::str("LuaJIT worker \"", name, "\" failed to initialize: ", exception));
+      co_return makeInvalidConfigService();
+    }
+    KJ_IF_SOME(service, kj::mv(luaService)) {
+      co_return kj::mv(service);
+    }
+    KJ_UNREACHABLE;
+  }
+
   capnp::MallocMessageBuilder arena;
   // TODO(beta): Factor out FeatureFlags from WorkerBundle.
   auto featureFlags = arena.initRoot<CompatibilityFlags>();
@@ -7484,7 +7563,7 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
   // First pass: Extract actor namespace configs.
   kj::HashSet<kj::String> durableNamespaceKeys;
   for (auto serviceConf: config.getServices()) {
-    if (!serviceConf.isWorker()) continue;
+    if (!serviceConf.isWorker() || serviceConf.getWorker().isLuaScript()) continue;
     for (auto ns: serviceConf.getWorker().getDurableObjectNamespaces()) {
       if (ns.isUniqueKey()) durableNamespaceKeys.insert(kj::str(ns.getUniqueKey()));
     }
@@ -7495,7 +7574,7 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
     kj::StringPtr name = serviceConf.getName();
     kj::HashMap<kj::String, ActorConfig> serviceActorConfigs;
 
-    if (serviceConf.isWorker()) {
+    if (serviceConf.isWorker() && !serviceConf.getWorker().isLuaScript()) {
       auto workerConf = serviceConf.getWorker();
       bool hadDurable = false;
       for (auto ns: workerConf.getDurableObjectNamespaces()) {
@@ -7693,7 +7772,9 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
   // Engine should run, and initializes the synthetic namespace (created in the first pass) as an
   // external actor served by that Engine class.
   for (auto serviceConf: config.getServices()) {
-    if (!serviceConf.isWorker() || !serviceConf.getWorker().hasWorkflowsEngine()) continue;
+    if (!serviceConf.isWorker() || serviceConf.getWorker().isLuaScript() ||
+        !serviceConf.getWorker().hasWorkflowsEngine())
+      continue;
 
     auto name = serviceConf.getName();
     ConfigErrorReporter errorReporter(*this, name);

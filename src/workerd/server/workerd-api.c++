@@ -413,6 +413,8 @@ Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
     case config::Worker::INHERIT:
       // TODO(beta): Support inherit.
       KJ_FAIL_ASSERT("inherit should have been handled earlier");
+    case config::Worker::LUA_SCRIPT:
+      KJ_FAIL_ASSERT("LuaJIT worker source must not be extracted as a JavaScript worker");
   }
 
   errorReporter.addError(kj::str("Encountered unknown Worker code type. Was the "

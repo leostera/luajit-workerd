@@ -811,6 +811,79 @@ KJ_TEST("Server: serve basic Service Worker") {
     Bad Request)"_blockquote);
 }
 
+KJ_TEST("Server: serve LuaJIT HTTP worker selected from config") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function(request) return { status = 202, headers = {{ name = 'Content-Type', value = 'text/plain;charset=UTF-8' }}, body = 'lua:' .. request.url } end }"
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/lua");
+  conn.recv("HTTP/1.1 202 LuaJIT\n"
+            "Content-Length: 18\n"
+            "Content-Type: text/plain;charset=UTF-8\n"
+            "\n"
+            "lua:http://foo/lua");
+}
+
+KJ_TEST("Server: LuaJIT worker requires experimental mode") {
+  TestServer test(singleWorker(
+      R"((luaScript = "return { fetch = function() return { status = 200, body = '' } end }"))"_kj));
+  test.expectErrors(R"(
+    service hello: LuaJIT workers are experimental; run workerd with `--experimental`.
+  )"_blockquote);
+}
+
+KJ_TEST("Server: LuaJIT worker rejects unsupported config") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+    moduleFallback = "fallback"
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.expectErrors(R"(
+    service hello: LuaJIT worker "hello" does not support module fallback.
+  )"_blockquote);
+}
+
+KJ_TEST("Server: LuaJIT worker rejects bindings") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+    bindings = [(name = "ignored", json = "null")]
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.expectErrors(R"(
+    service hello: LuaJIT worker "hello" does not support bindings.
+  )"_blockquote);
+}
+
+KJ_TEST("Server: LuaJIT worker rejects WebSockets and CONNECT") {
+  TestServer test(singleWorker(
+      R"((luaScript = "return { fetch = function() return { status = 200, body = '' } end }"))"_kj));
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send(R"(
+    GET /socket HTTP/1.1
+    Host: foo
+    Upgrade: websocket
+    Connection: Upgrade
+    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+    Sec-WebSocket-Version: 13
+
+  )"_blockquote);
+  kj::StringPtr websocketBody = "LuaJIT workers do not support WebSockets."_kj;
+  conn.recv(kj::str("HTTP/1.1 501 Not Implemented\nContent-Length: ", websocketBody.size(), "\n\n",
+      websocketBody));
+
+  conn.send("CONNECT foo:443 HTTP/1.1\nHost: foo\n\n");
+  conn.recv("HTTP/1.1 501 Not Implemented\nConnection: close\nContent-Length: 0\n\n");
+}
+
 KJ_TEST("Server: serve Service Worker using the new module registry") {
   TestServer test(singleWorker(R"((
     compatibilityDate = "2022-08-17",
