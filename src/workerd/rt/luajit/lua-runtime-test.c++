@@ -1176,6 +1176,59 @@ KJ_TEST("LuaJIT parses remote URLs and relative references") {
       "https://user:pass@example.com:8443/a%20b/b/?x=1&x=two&flag#frag|https|example.com:8443|a b/b|true|3|x=1|x=two|flag=nil|frag|user|pass|https://example.com/a/next?ok|true|true|true|true");
 }
 
+KJ_TEST("LuaJIT computes bounded binary-safe SHA-2 digests") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    local function toHex(bytes)
+      return (bytes:gsub(".", function(byte)
+        return string.format("%02x", byte:byte())
+      end))
+    end
+    return {
+      fetch = function()
+        local maxInput = workerd.digest("SHA-256", string.rep("a", 1048576))
+        local oversized = pcall(function()
+          workerd.digest("SHA-256", string.rep("a", 1048577))
+        end)
+        local unsupported = pcall(workerd.digest, "SHA3-256", "abc")
+        local wrongType = pcall(workerd.digest, "SHA-256", 123)
+        local wrongArity = pcall(workerd.digest, "SHA-256", "abc", "extra")
+        return {
+          status = 200,
+          body = table.concat({
+            toHex(workerd.digest("MD5", "abc")),
+            toHex(workerd.digest("SHA-1", "abc")),
+            toHex(workerd.digest("SHA-256", "abc")),
+            toHex(workerd.digest("sha-384", "abc")),
+            toHex(workerd.digest("SHA-512", "abc")),
+            toHex(workerd.digest("SHA-256", "")),
+            toHex(workerd.digest("SHA-256", "a\0b")),
+            tostring(#maxInput == 32),
+            tostring(not oversized),
+            tostring(not unsupported),
+            tostring(not wrongType),
+            tostring(not wrongArity),
+          }, ":"),
+        }
+      end,
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/digest"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) ==
+      "900150983cd24fb0d6963f7d28e17f72:a9993e364706816aba3e25717850c26c9cd0d89d:"
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad:"
+      "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+      "8086072ba1e7cc2358baeca134c825a7:"
+      "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+      "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f:"
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855:"
+      "59b271ae1bbcb1d31d41929817f4b16fb439eb4f31520b5ad1d5ce98920a7138:true:true:true:true:true");
+}
+
 KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(

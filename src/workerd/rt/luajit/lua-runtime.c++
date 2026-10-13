@@ -10,6 +10,7 @@
 #include <workerd/util/uuid.h>
 
 #include <lua.hpp>
+#include <openssl/evp.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -214,6 +215,60 @@ void pushParsedUrl(lua_State* state, kj::Url& url) {
       setStringField(state, "password", password);
     }
   }
+}
+
+bool equalsAsciiCaseInsensitive(const char* value, size_t valueLength, const char* expected) {
+  size_t expectedLength = std::strlen(expected);
+  if (valueLength != expectedLength) return false;
+  for (size_t i = 0; i < valueLength; ++i) {
+    char character = value[i];
+    if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+    if (character != expected[i]) return false;
+  }
+  return true;
+}
+
+int digest(lua_State* state) {
+  if (lua_gettop(state) != 2 || lua_type(state, 1) != LUA_TSTRING ||
+      lua_type(state, 2) != LUA_TSTRING) {
+    return luaL_error(state, "workerd.digest() expects an algorithm and a binary string");
+  }
+
+  size_t algorithmLength = 0;
+  const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
+  const EVP_MD* digestAlgorithm = nullptr;
+  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "MD5")) {
+    digestAlgorithm = EVP_md5();
+  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-1")) {
+    digestAlgorithm = EVP_sha1();
+  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-256")) {
+    digestAlgorithm = EVP_sha256();
+  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-384")) {
+    digestAlgorithm = EVP_sha384();
+  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-512")) {
+    digestAlgorithm = EVP_sha512();
+  } else {
+    return luaL_error(state, "workerd.digest() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
+  }
+
+  size_t inputLength = 0;
+  const char* input = lua_tolstring(state, 2, &inputLength);
+  if (inputLength > LuaRuntime::MAX_DIGEST_BYTES) {
+    return luaL_error(state, "workerd.digest() input exceeds the 1048576-byte limit");
+  }
+
+  unsigned char output[64];
+  int expectedOutputLength = EVP_MD_size(digestAlgorithm);
+  if (expectedOutputLength <= 0 || static_cast<size_t>(expectedOutputLength) > sizeof(output)) {
+    return luaL_error(state, "workerd.digest() failed");
+  }
+  unsigned int outputLength = 0;
+  if (EVP_Digest(input, inputLength, output, &outputLength, digestAlgorithm, nullptr) != 1 ||
+      outputLength != static_cast<unsigned int>(expectedOutputLength)) {
+    return luaL_error(state, "workerd.digest() failed");
+  }
+  lua_pushlstring(state, reinterpret_cast<const char*>(output), outputLength);
+  return 1;
 }
 
 int parseUrl(lua_State* state) {
@@ -762,6 +817,8 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<L
   lua_getglobal(state, "workerd");
   lua_pushcfunction(state, parseUrl);
   lua_setfield(state, -2, "parseUrl");
+  lua_pushcfunction(state, digest);
+  lua_setfield(state, -2, "digest");
   lua_pop(state, 1);
 
   int loadStatus = luaL_loadbuffer(state, moduleSource.begin(), moduleSource.size(), "worker.lua");

@@ -52,7 +52,7 @@ Lua host operations use a closed, typed protocol:
 
 1. A Lua wrapper such as `workerd.sleep(...)`, `workerd.randomBytes(...)`, `workerd.randomUUID()`, or `workerd.fetch(...)` validates its Lua arguments and yields a descriptor.
 2. The C++ bridge parses the descriptor with raw Lua table access into a typed operation. Reject unknown operations and malformed fields; do not invoke user metamethods during parsing.
-3. Pure operations such as random-byte generation are handled synchronously by the runtime bridge. Request I/O operations are started by the request's `LuaHostOperations` as KJ promises.
+3. Pure operations such as random-byte generation and bounded `workerd.digest()` are handled synchronously by the runtime bridge. Request I/O operations are started by the request's `LuaHostOperations` as KJ promises.
 4. On async completion, the bridge resumes only that request's coroutine with a result or a typed error. The operation and coroutine are destroyed exactly once on completion or cancellation.
 
 A promise continuation must not retain a borrowed `lua_State*`, response object, host stream, or request context after its owner is gone. Use explicit request ownership/attachments and cancellation cleanup; verify this with cancellation and teardown tests. Coroutines are cooperative: this bridge yields only at registered host calls and does not interrupt CPU-bound Lua.
@@ -69,7 +69,7 @@ return {
 }
 ```
 
-Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, `workerd.randomBytes`, `workerd.randomUUID`, and a Lua-designed async `workerd.fetch`). Simple text, binary-data, and JSON bindings are exposed through `workerd.bindings`; JSON `null` is represented by `workerd.null`. This preserves the `fetch(request)` signature without adding JavaScript-shaped `env` or `ctx` parameters. Binding values are installed when the service's Lua state starts and therefore share Lua's service-global mutability/lifetime. Each future capability must make its config and request-scoped availability explicit.
+Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, `workerd.randomBytes`, `workerd.randomUUID`, bounded `workerd.digest()`, and a Lua-designed async `workerd.fetch`). Simple text, binary-data, and JSON bindings are exposed through `workerd.bindings`; JSON `null` is represented by `workerd.null`. This preserves the `fetch(request)` signature without adding JavaScript-shaped `env` or `ctx` parameters. Binding values are installed when the service's Lua state starts and therefore share Lua's service-global mutability/lifetime. Each future capability must make its config and request-scoped availability explicit.
 
 Do not mirror JavaScript `Request`, `Response`, `Promise`, `ReadableStream`, or DOM object semantics by name unless a written Lua contract and tests establish the needed equivalence. Prefer simple Lua values and small resource wrappers with explicit close/cancel behavior. `workerd.parseUrl(url[, base])` is a synchronous, narrow adapter over `kj::Url`: it converts parsed URL components into plain Lua tables and deliberately does not expose the KJ type or promise WHATWG URL semantics.
 
