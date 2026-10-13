@@ -169,6 +169,10 @@ class LuaHostOperationsWithoutRequestBody: public LuaHostOperations {
     KJ_FAIL_REQUIRE("mock does not provide random bytes");
   }
 
+  kj::String generateRandomUuid() override {
+    KJ_FAIL_REQUIRE("mock does not provide random UUIDs");
+  }
+
   kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override {
     KJ_FAIL_REQUIRE("mock does not provide an inbound request body stream");
   }
@@ -183,6 +187,11 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   void fillRandomBytes(kj::ArrayPtr<kj::byte> output) override {
     ++randomBytesCalls;
     for (size_t i = 0; i < output.size(); ++i) output[i] = static_cast<kj::byte>(i);
+  }
+
+  kj::String generateRandomUuid() override {
+    ++randomUuidCalls;
+    return kj::str("01234567-89ab-4cde-8fab-0123456789ab");
   }
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
@@ -215,6 +224,7 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   kj::Vector<kj::Array<kj::byte>> bodyProducerChunks;
   bool bodyProducerReachedEof = false;
   size_t randomBytesCalls = 0;
+  size_t randomUuidCalls = 0;
 };
 
 class CancelableLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
@@ -1030,6 +1040,7 @@ KJ_TEST("LuaJIT randomBytes returns bounded binary-safe strings") {
         local bytes = workerd.randomBytes(32)
         local empty = workerd.randomBytes(0)
         local maximum = workerd.randomBytes(65536)
+        local uuid = workerd.randomUUID()
         local negative = pcall(workerd.randomBytes, -1)
         local fractional = pcall(workerd.randomBytes, 1.5)
         local tooLarge = pcall(workerd.randomBytes, 65537)
@@ -1042,7 +1053,7 @@ KJ_TEST("LuaJIT randomBytes returns bounded binary-safe strings") {
           body = table.concat({
             tostring(type(bytes) == "string"), tostring(#bytes),
             tostring(string.byte(bytes, 1)), tostring(string.byte(bytes, 32)), tostring(empty == ""),
-            tostring(#maximum), tostring(negative), tostring(fractional), tostring(tooLarge), tostring(wrongType),
+            tostring(#maximum), uuid, tostring(negative), tostring(fractional), tostring(tooLarge), tostring(wrongType),
             tostring(malformedDescriptor),
           }, ":"),
         }
@@ -1056,8 +1067,10 @@ KJ_TEST("LuaJIT randomBytes returns bounded binary-safe strings") {
   kj::HttpHeaders headers(headerTable);
   auto response = runtime.fetch("GET"_kj, "/random"_kj, headers, nullptr, hostOperations.getPtr())
                       .wait(io.waitScope);
-  KJ_EXPECT(asString(response.body) == "true:32:0:31:true:65536:false:false:false:false:false");
+  KJ_EXPECT(asString(response.body) ==
+      "true:32:0:31:true:65536:01234567-89ab-4cde-8fab-0123456789ab:false:false:false:false:false");
   KJ_EXPECT(hostOperations.randomBytesCalls == 3);
+  KJ_EXPECT(hostOperations.randomUuidCalls == 1);
 }
 
 KJ_TEST("LuaJIT parses remote URLs and relative references") {

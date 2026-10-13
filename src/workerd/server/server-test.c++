@@ -1143,7 +1143,7 @@ KJ_TEST("Server: LuaJIT rejects Durable Object storage") {
 
 KJ_TEST("Server: LuaJIT randomBytes uses the configured entropy source") {
   TestServer test(singleWorker(R"((
-    luaScript = "return { fetch = function() local bytes = workerd.randomBytes(16); return { status = 200, body = tostring(#bytes) } end }"
+    luaScript = "return { fetch = function() local bytes = workerd.randomBytes(16); return { status = 200, body = tostring(#bytes) .. ':' .. workerd.randomUUID() } end }"
   ))"_kj));
 
   test.server.allowExperimental();
@@ -1151,7 +1151,8 @@ KJ_TEST("Server: LuaJIT randomBytes uses the configured entropy source") {
 
   auto conn = test.connect("test-addr");
   conn.sendHttpGet("/");
-  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*16)");
+  conn.recvRegex(
+      R"(HTTP/1\.1 200 LuaJIT[\s\S]*16:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})");
 }
 
 KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {

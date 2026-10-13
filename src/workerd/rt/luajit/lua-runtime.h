@@ -84,8 +84,9 @@ class LuaHostOperations: public kj::PtrTarget {
     return addPtrToThis();
   }
   virtual kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) = 0;
-  // Fill using the request's configured entropy source.
+  // Use the request's configured entropy source.
   virtual void fillRandomBytes(kj::ArrayPtr<kj::byte> output) = 0;
+  virtual kj::String generateRandomUuid() = 0;
   virtual bool hasRequestBodyStream() const = 0;
   // Read up to maxBytes from the current inbound request body; return none at EOF.
   virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) = 0;

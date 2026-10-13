@@ -7,6 +7,7 @@
 #include "lua-worker-interface.h"
 
 #include <workerd/io/observer.h>
+#include <workerd/util/uuid.h>
 
 #include <lua.hpp>
 
@@ -44,6 +45,10 @@ function workerd.randomBytes(size)
     error("workerd.randomBytes() requires an integer size from 0 through 65536", 2)
   end
   return workerd.await({ operation = "randomBytes", size = size })
+end
+
+function workerd.randomUUID()
+  return workerd.await({ operation = "randomUUID" })
 end
 
 function workerd.fetch(request)
@@ -559,6 +564,8 @@ struct LuaRandomBytesRequest {
   size_t size;
 };
 
+struct LuaRandomUuidRequest {};
+
 LuaBodyReadRequest readBodyReadRequest(lua_State* state) {
   int descriptorIndex = absoluteIndex(state, -1);
   auto requestId = readBodyRequestId(state, descriptorIndex);
@@ -590,7 +597,8 @@ kj::OneOf<kj::Duration,
     LuaBodyReadRequest,
     LuaBodyCancelRequest,
     LuaRequestBodyReadRequest,
-    LuaRandomBytesRequest>
+    LuaRandomBytesRequest,
+    LuaRandomUuidRequest>
 readHostOperation(lua_State* state) {
   KJ_REQUIRE(lua_gettop(state) == 1, "LuaJIT host operation must yield one descriptor");
   KJ_REQUIRE(lua_istable(state, -1), "LuaJIT host operation descriptor must be a table");
@@ -602,6 +610,7 @@ readHostOperation(lua_State* state) {
   lua_pop(state, 1);
 
   if (name == "sleep") return readSleepDelay(state);
+  if (name == "randomUUID") return LuaRandomUuidRequest{};
   if (name == "randomBytes") {
     int descriptorIndex = absoluteIndex(state, -1);
     getRawField(state, descriptorIndex, "size");
@@ -793,6 +802,14 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
           co_await timer.afterDelay(delay);
           lua_pushboolean(coroutine, 1);
         }
+        KJ_CASE_ONEOF(randomUuid, LuaRandomUuidRequest) {
+          KJ_IF_SOME(host, hostOperations) {
+            auto uuid = host->generateRandomUuid();
+            lua_pushlstring(coroutine, uuid.begin(), uuid.size());
+          } else {
+            KJ_FAIL_REQUIRE("workerd.randomUUID() requires host operations");
+          }
+        }
         KJ_CASE_ONEOF(randomBytes, LuaRandomBytesRequest) {
           auto bytes = kj::heapArray<kj::byte>(randomBytes.size);
           KJ_IF_SOME(host, hostOperations) {
@@ -946,6 +963,10 @@ bool LuaIoContext::hasRequestBodyStream() const {
 
 void LuaIoContext::fillRandomBytes(kj::ArrayPtr<kj::byte> output) {
   entropySource.generate(output);
+}
+
+kj::String LuaIoContext::generateRandomUuid() {
+  return workerd::randomUUID(entropySource);
 }
 
 void LuaIoContext::setRequestBodyStream(kj::AsyncInputStream& stream) {
