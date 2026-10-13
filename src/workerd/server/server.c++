@@ -2096,7 +2096,7 @@ class Server::LuaWorkerService final: public Service {
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
     KJ_REQUIRE(outbound.get() != nullptr, "LuaJIT worker has not been linked", name);
     return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(*runtime, *outbound, headerTable,
-        kj::mv(metadata), kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+        kj::mv(metadata), server.entropySource, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
         kj::refcounted<RequestObserver>(), requestBodyMode);
   }
 

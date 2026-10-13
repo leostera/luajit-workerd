@@ -1,7 +1,7 @@
 # LuaJIT host-capability integration: architecture and implementation
 
 - **Status:** Architecture and implementation note for experimental Lua host capabilities; this document does not define a stable API.
-- **Source snapshot:** workerd `f7cc6dd86` (`leostera/luajit`), inspected 2026-10-13.
+- **Source snapshot:** workerd `e2c2fa468` (`leostera/luajit`), inspected 2026-10-13.
 - **Related checklist:** [feature-matrix.md](feature-matrix.md).
 
 ## Decision
@@ -42,18 +42,18 @@ The current constructor receives the source, simple bindings, timer, configured 
 
 `workerd.sleep()` is implemented by the coroutine bridge and the runtime timer; response stream handles are owned by the coroutine invocation. KJ cancellation tears down the in-flight promise and request-local streams. Keep this narrower than `IoContext`; do not transplant its `Worker::Lock` and isolate lifecycle into Lua. `IoChannelFactory` and `RequestObserver` remain host-side types and are not exposed to Lua code.
 
-The current `LuaHostOperations` interface in `src/workerd/rt/luajit/lua-runtime.h` contains the Lua-native HTTP request/response types and an async `fetch()` operation. It does not expose `sleep()` or `onAbort()` as virtual methods: timer suspension is handled by the runtime bridge, and cancellation is expressed through KJ promise lifetime.
+The current `LuaHostOperations` interface in `src/workerd/rt/luajit/lua-runtime.h` contains the Lua-native HTTP request/response types, an async `fetch()` operation, and a synchronous random-byte fill operation. `LuaIoContext` delegates randomness to the same injected `kj::EntropySource` used by the standard request context. It does not expose `sleep()` or `onAbort()` as virtual methods: timer suspension is handled by the runtime bridge, and cancellation is expressed through KJ promise lifetime.
 
 ### 3. Lua runtime and coroutine bridge
 
 `LuaRuntime` owns one service-lifetime Lua state, as today. A fetch invocation owns one Lua coroutine and a registry reference until success, error, or cancellation. All Lua API calls and coroutine resumes happen on the owning event-loop thread; no concurrent or nested `lua_resume()` calls are permitted.
 
-Host async operations use a closed, typed protocol:
+Lua host operations use a closed, typed protocol:
 
-1. A Lua wrapper such as `workerd.sleep(...)` or `workerd.fetch(...)` validates its Lua arguments and yields a descriptor.
+1. A Lua wrapper such as `workerd.sleep(...)`, `workerd.randomBytes(...)`, or `workerd.fetch(...)` validates its Lua arguments and yields a descriptor.
 2. The C++ bridge parses the descriptor with raw Lua table access into a typed operation. Reject unknown operations and malformed fields; do not invoke user metamethods during parsing.
-3. The request's `LuaHostOperations` starts the KJ promise.
-4. On completion, the bridge resumes only that request's coroutine with a result or a typed error. The operation and coroutine are destroyed exactly once on completion or cancellation.
+3. Pure operations such as random-byte generation are handled synchronously by the runtime bridge. Request I/O operations are started by the request's `LuaHostOperations` as KJ promises.
+4. On async completion, the bridge resumes only that request's coroutine with a result or a typed error. The operation and coroutine are destroyed exactly once on completion or cancellation.
 
 A promise continuation must not retain a borrowed `lua_State*`, response object, host stream, or request context after its owner is gone. Use explicit request ownership/attachments and cancellation cleanup; verify this with cancellation and teardown tests. Coroutines are cooperative: this bridge yields only at registered host calls and does not interrupt CPU-bound Lua.
 
@@ -69,7 +69,7 @@ return {
 }
 ```
 
-Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, and a Lua-designed async `workerd.fetch`). Simple text, binary-data, and JSON bindings are exposed through `workerd.bindings`; JSON `null` is represented by `workerd.null`. This preserves the `fetch(request)` signature without adding JavaScript-shaped `env` or `ctx` parameters. Binding values are installed when the service's Lua state starts and therefore share Lua's service-global mutability/lifetime. Each future capability must make its config and request-scoped availability explicit.
+Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, `workerd.randomBytes`, and a Lua-designed async `workerd.fetch`). Simple text, binary-data, and JSON bindings are exposed through `workerd.bindings`; JSON `null` is represented by `workerd.null`. This preserves the `fetch(request)` signature without adding JavaScript-shaped `env` or `ctx` parameters. Binding values are installed when the service's Lua state starts and therefore share Lua's service-global mutability/lifetime. Each future capability must make its config and request-scoped availability explicit.
 
 Do not mirror JavaScript `Request`, `Response`, `Promise`, `ReadableStream`, or DOM object semantics by name unless a written Lua contract and tests establish the needed equivalence. Prefer simple Lua values and small resource wrappers with explicit close/cancel behavior. `workerd.parseUrl(url[, base])` is a synchronous, narrow adapter over `kj::Url`: it converts parsed URL components into plain Lua tables and deliberately does not expose the KJ type or promise WHATWG URL semantics.
 

@@ -39,6 +39,13 @@ function workerd.sleep(milliseconds)
   return workerd.await({ operation = "sleep", milliseconds = milliseconds })
 end
 
+function workerd.randomBytes(size)
+  if type(size) ~= "number" or size ~= math.floor(size) or size < 0 or size > 65536 then
+    error("workerd.randomBytes() requires an integer size from 0 through 65536", 2)
+  end
+  return workerd.await({ operation = "randomBytes", size = size })
+end
+
 function workerd.fetch(request)
   if type(request) ~= "table" then
     error("workerd.fetch() requires a request table", 2)
@@ -548,6 +555,10 @@ struct LuaRequestBodyReadRequest {
   size_t maxBytes;
 };
 
+struct LuaRandomBytesRequest {
+  size_t size;
+};
+
 LuaBodyReadRequest readBodyReadRequest(lua_State* state) {
   int descriptorIndex = absoluteIndex(state, -1);
   auto requestId = readBodyRequestId(state, descriptorIndex);
@@ -578,7 +589,8 @@ kj::OneOf<kj::Duration,
     LuaHttpRequest,
     LuaBodyReadRequest,
     LuaBodyCancelRequest,
-    LuaRequestBodyReadRequest>
+    LuaRequestBodyReadRequest,
+    LuaRandomBytesRequest>
 readHostOperation(lua_State* state) {
   KJ_REQUIRE(lua_gettop(state) == 1, "LuaJIT host operation must yield one descriptor");
   KJ_REQUIRE(lua_istable(state, -1), "LuaJIT host operation descriptor must be a table");
@@ -590,6 +602,19 @@ readHostOperation(lua_State* state) {
   lua_pop(state, 1);
 
   if (name == "sleep") return readSleepDelay(state);
+  if (name == "randomBytes") {
+    int descriptorIndex = absoluteIndex(state, -1);
+    getRawField(state, descriptorIndex, "size");
+    int isNumber = 0;
+    lua_Integer size = lua_tointegerx(state, -1, &isNumber);
+    bool validSize = lua_type(state, -1) == LUA_TNUMBER && isNumber && size >= 0 &&
+        size <= LuaRuntime::MAX_RANDOM_BYTES &&
+        static_cast<lua_Number>(size) == lua_tonumber(state, -1);
+    lua_pop(state, 1);
+    KJ_REQUIRE(validSize, "workerd.randomBytes() requires an integer size from 0 through",
+        LuaRuntime::MAX_RANDOM_BYTES);
+    return LuaRandomBytesRequest{.size = static_cast<size_t>(size)};
+  }
   if (name == "fetch") {
     getRawField(state, -1, "request");
     auto request = readFetchRequest(state, -1);
@@ -768,6 +793,19 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
           co_await timer.afterDelay(delay);
           lua_pushboolean(coroutine, 1);
         }
+        KJ_CASE_ONEOF(randomBytes, LuaRandomBytesRequest) {
+          auto bytes = kj::heapArray<kj::byte>(randomBytes.size);
+          KJ_IF_SOME(host, hostOperations) {
+            host->fillRandomBytes(bytes);
+          } else {
+            KJ_FAIL_REQUIRE("workerd.randomBytes() requires host operations");
+          }
+          if (bytes.size() == 0) {
+            lua_pushlstring(coroutine, "", 0);
+          } else {
+            lua_pushlstring(coroutine, reinterpret_cast<const char*>(bytes.begin()), bytes.size());
+          }
+        }
         KJ_CASE_ONEOF(request, LuaHttpRequest) {
           KJ_IF_SOME(bodyStreamRequestId, request.bodyStreamRequestId) {
             KJ_REQUIRE(requestBodyMode == LuaRequestBodyMode::STREAMING,
@@ -887,6 +925,7 @@ kj::Promise<void> respondNotImplemented(kj::HttpService::Response& response,
 LuaIoContext::LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
     const kj::HttpHeaderTable& headerTable,
     IoChannelFactory::SubrequestMetadata metadata,
+    kj::EntropySource& entropySource,
     kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
     kj::Own<workerd::RequestObserver> observer)
     : subrequestLimitPolicy(kj::mv(subrequestLimitPolicy)),
@@ -894,6 +933,7 @@ LuaIoContext::LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
       requestScope(*this->subrequestLimitPolicy, *this->observer),
       outbound(outbound),
       headerTable(headerTable),
+      entropySource(entropySource),
       cfBlobJson(kj::mv(metadata.cfBlobJson)),
       parentSpan(kj::mv(metadata.parentSpan)),
       userSpanParent(kj::mv(metadata.userSpanParent)) {}
@@ -902,6 +942,10 @@ LuaIoContext::~LuaIoContext() noexcept(false) = default;
 
 bool LuaIoContext::hasRequestBodyStream() const {
   return requestBodyStream != kj::none;
+}
+
+void LuaIoContext::fillRandomBytes(kj::ArrayPtr<kj::byte> output) {
+  entropySource.generate(output);
 }
 
 void LuaIoContext::setRequestBodyStream(kj::AsyncInputStream& stream) {
@@ -1028,12 +1072,17 @@ LuaWorkerInterface::LuaWorkerInterface(LuaRuntime& runtime,
     IoChannelFactory::SubrequestChannel& outbound,
     const kj::HttpHeaderTable& headerTable,
     IoChannelFactory::SubrequestMetadata metadata,
+    kj::EntropySource& entropySource,
     kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
     kj::Own<workerd::RequestObserver> observer,
     LuaRequestBodyMode requestBodyMode)
     : runtime(runtime),
-      hostOperations(
-          outbound, headerTable, kj::mv(metadata), kj::mv(subrequestLimitPolicy), kj::mv(observer)),
+      hostOperations(outbound,
+          headerTable,
+          kj::mv(metadata),
+          entropySource,
+          kj::mv(subrequestLimitPolicy),
+          kj::mv(observer)),
       requestBodyMode(requestBodyMode) {}
 
 kj::Promise<void> LuaWorkerInterface::request(kj::HttpMethod method,

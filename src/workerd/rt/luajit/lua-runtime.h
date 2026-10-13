@@ -84,6 +84,8 @@ class LuaHostOperations: public kj::PtrTarget {
     return addPtrToThis();
   }
   virtual kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) = 0;
+  // Fill using the request's configured entropy source.
+  virtual void fillRandomBytes(kj::ArrayPtr<kj::byte> output) = 0;
   virtual bool hasRequestBodyStream() const = 0;
   // Read up to maxBytes from the current inbound request body; return none at EOF.
   virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) = 0;
@@ -97,6 +99,7 @@ class LuaRuntime final {
   static constexpr size_t MAX_HTTP_BODY_BYTES = 1024 * 1024;
   static constexpr size_t MAX_HTTP_HEADERS = 128;
   static constexpr size_t MAX_HTTP_READ_CHUNK_BYTES = 64 * 1024;
+  static constexpr size_t MAX_RANDOM_BYTES = 64 * 1024;
 
   // The module must return a table with a callable `fetch` field. This runtime owns one LuaJIT
   // state for its lifetime; each fetch() runs on a coroutine and yields only through host async
