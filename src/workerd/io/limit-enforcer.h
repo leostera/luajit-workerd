@@ -145,6 +145,9 @@ class LimitEnforcer: public SubrequestLimitPolicy, public KvOperationLimitPolicy
       case KvOperationType::DELETE:
         newKvRequest(KvOpType::DELETE);
         break;
+      case KvOperationType::LIST:
+        newKvRequest(KvOpType::LIST);
+        break;
     }
   }
 

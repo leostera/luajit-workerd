@@ -97,6 +97,13 @@ struct LuaHttpResponse {
 
 struct LuaKvResponse {
   kj::Own<kj::AsyncInputStream> body;
+  kj::Maybe<kj::String> cacheStatus = kj::none;
+};
+
+struct LuaKvListOptions {
+  kj::Maybe<uint32_t> limit;
+  kj::Maybe<kj::String> prefix;
+  kj::Maybe<kj::String> cursor;
 };
 
 struct LuaResponse {
@@ -133,6 +140,7 @@ class LuaHostOperations: public kj::PtrTarget {
   virtual kj::Promise<void> kvPut(
       size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) = 0;
   virtual kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) = 0;
+  virtual kj::Promise<LuaKvResponse> kvList(size_t bindingIndex, LuaKvListOptions options) = 0;
 };
 
 class LuaRuntime final {
@@ -147,7 +155,9 @@ class LuaRuntime final {
   static constexpr size_t MAX_HMAC_KEY_BYTES = 64 * 1024;
   static constexpr size_t MAX_CRYPTO_INPUT_BYTES = 1024 * 1024;
   static constexpr size_t MAX_KV_KEY_BYTES = 512;
+  static constexpr size_t MAX_KV_CURSOR_BYTES = 4 * 1024;
   static constexpr size_t MAX_KV_VALUE_BYTES = 1024 * 1024;
+  static constexpr size_t MAX_KV_RESPONSE_BYTES = 1024 * 1024;
 
   // The module must return a table with a callable `fetch` field. This runtime owns one LuaJIT
   // state for its lifetime; each fetch() runs on a coroutine and yields only through host async

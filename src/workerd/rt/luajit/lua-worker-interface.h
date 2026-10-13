@@ -36,6 +36,7 @@ class LuaIoContext final: public LuaHostOperations {
   kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override;
   kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override;
   kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) override;
+  kj::Promise<LuaKvResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override;
   void fillRandomBytes(kj::ArrayPtr<kj::byte> output) override;
   kj::String generateRandomUuid() override;
   kj::Maybe<kj::String> getRequestCfJson() const override;

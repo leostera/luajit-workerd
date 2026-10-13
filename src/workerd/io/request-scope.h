@@ -31,6 +31,7 @@ enum class KvOperationType {
   GET,
   PUT,
   DELETE,
+  LIST,
 };
 
 class KvOperationLimitPolicy {

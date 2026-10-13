@@ -86,6 +86,16 @@ function workerd.createKvNamespace(kvBindingIndex)
       if type(key) ~= "string" then error("KV delete() requires a string key", 2) end
       return workerd.await({ operation = "kvDelete", kvBindingIndex = kvBindingIndex, key = key })
     end,
+    list = function(options)
+      if options ~= nil and type(options) ~= "table" then
+        error("KV list() options must be a table", 2)
+      end
+      return workerd.await({
+        operation = "kvList",
+        kvBindingIndex = kvBindingIndex,
+        options = options,
+      })
+    end,
   }
 end
 
@@ -607,6 +617,65 @@ void pushJsonValue(lua_State* state, capnp::JsonValue::Reader value, size_t dept
   KJ_UNREACHABLE;
 }
 
+void pushJsonText(lua_State* state, kj::StringPtr json) {
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder arena;
+  auto root = arena.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(json, root);
+  pushJsonValue(state, root.asReader());
+}
+
+void pushLuaKvListResult(lua_State* state, kj::StringPtr json, kj::Maybe<kj::String> cacheStatus) {
+  pushJsonText(state, json);
+  int resultIndex = absoluteIndex(state, -1);
+  KJ_REQUIRE(lua_istable(state, resultIndex), "KV list response must be a JSON object");
+  getRawField(state, resultIndex, "list_complete");
+  KJ_REQUIRE(lua_type(state, -1) == LUA_TBOOLEAN,
+      "KV list response must contain a boolean list_complete field");
+  lua_pop(state, 1);
+  getRawField(state, resultIndex, "cursor");
+  KJ_REQUIRE(lua_type(state, -1) == LUA_TNIL || lua_type(state, -1) == LUA_TSTRING,
+      "KV list response cursor must be a string when present");
+  lua_pop(state, 1);
+
+  getRawField(state, resultIndex, "keys");
+  KJ_REQUIRE(lua_istable(state, -1), "KV list response must contain a keys array");
+  int keysIndex = absoluteIndex(state, -1);
+  size_t keyCount = lua_objlen(state, keysIndex);
+  KJ_REQUIRE(keyCount <= INT_MAX, "KV list response contains too many keys");
+
+  for (size_t i = 1; i <= keyCount; ++i) {
+    lua_rawgeti(state, keysIndex, static_cast<int>(i));
+    KJ_REQUIRE(lua_istable(state, -1), "KV list key must be a JSON object");
+    int keyIndex = absoluteIndex(state, -1);
+    getRawField(state, keyIndex, "name");
+    KJ_REQUIRE(lua_type(state, -1) == LUA_TSTRING, "KV list key must have a string name");
+    lua_pop(state, 1);
+    getRawField(state, keyIndex, "metadata");
+    if (lua_type(state, -1) == LUA_TSTRING) {
+      size_t metadataSize = 0;
+      const char* metadata = lua_tolstring(state, -1, &metadataSize);
+      auto metadataJson = kj::heapString(metadata, metadataSize);
+      lua_pop(state, 1);
+      lua_pushstring(state, "metadata");
+      pushJsonText(state, metadataJson);
+      lua_rawset(state, keyIndex);
+    } else {
+      lua_pop(state, 1);
+    }
+    lua_pop(state, 1);
+  }
+  lua_pop(state, 1);
+
+  lua_pushstring(state, "cacheStatus");
+  KJ_IF_SOME(status, cacheStatus) {
+    lua_pushlstring(state, status.begin(), status.size());
+  } else {
+    pushWorkerdNull(state);
+  }
+  lua_rawset(state, resultIndex);
+}
+
 int getRequestCf(lua_State* state) {
   if (lua_type(state, 2) != LUA_TSTRING) {
     lua_pushnil(state);
@@ -963,6 +1032,11 @@ struct LuaKvDeleteRequest {
   kj::String key;
 };
 
+struct LuaKvListRequest {
+  size_t bindingIndex;
+  LuaKvListOptions options;
+};
+
 size_t readKvBindingIndex(lua_State* state, int descriptorIndex) {
   descriptorIndex = absoluteIndex(state, descriptorIndex);
   getRawField(state, descriptorIndex, "kvBindingIndex");
@@ -993,6 +1067,47 @@ kj::String readKvKey(lua_State* state, int descriptorIndex, const char* operatio
   return kj::heapString(key, length);
 }
 
+kj::Maybe<kj::String> readOptionalKvListString(
+    lua_State* state, int optionsIndex, const char* fieldName, size_t maxLength) {
+  getRawField(state, optionsIndex, fieldName);
+  if (lua_type(state, -1) == LUA_TNIL) {
+    lua_pop(state, 1);
+    return kj::none;
+  }
+  KJ_DEFER(lua_pop(state, 1));
+  KJ_REQUIRE(lua_type(state, -1) == LUA_TSTRING, "KV list() option must be a string", fieldName);
+  size_t length = 0;
+  const char* value = lua_tolstring(state, -1, &length);
+  KJ_REQUIRE(length <= maxLength, "KV list() option exceeds its byte limit", fieldName, maxLength);
+  return kj::heapString(value, length);
+}
+
+LuaKvListOptions readKvListOptions(lua_State* state, int descriptorIndex) {
+  descriptorIndex = absoluteIndex(state, descriptorIndex);
+  LuaStackGuard stackGuard(state);
+  getRawField(state, descriptorIndex, "options");
+  if (lua_type(state, -1) == LUA_TNIL) return {};
+  KJ_REQUIRE(lua_istable(state, -1), "KV list() options must be a table");
+  int optionsIndex = absoluteIndex(state, -1);
+
+  LuaKvListOptions options;
+  getRawField(state, optionsIndex, "limit");
+  if (lua_type(state, -1) != LUA_TNIL) {
+    int isNumber = 0;
+    lua_Integer limit = lua_tointegerx(state, -1, &isNumber);
+    bool validLimit = lua_type(state, -1) == LUA_TNUMBER && isNumber && limit >= 0 &&
+        limit <= 1000 && static_cast<lua_Number>(limit) == lua_tonumber(state, -1);
+    KJ_REQUIRE(validLimit, "KV list() limit must be an integer from 0 through 1000");
+    options.limit = static_cast<uint32_t>(limit);
+  }
+  lua_pop(state, 1);
+  options.prefix =
+      readOptionalKvListString(state, optionsIndex, "prefix", LuaRuntime::MAX_KV_KEY_BYTES);
+  options.cursor =
+      readOptionalKvListString(state, optionsIndex, "cursor", LuaRuntime::MAX_KV_CURSOR_BYTES);
+  return options;
+}
+
 kj::Array<kj::byte> readKvValue(lua_State* state, int descriptorIndex) {
   descriptorIndex = absoluteIndex(state, descriptorIndex);
   getRawField(state, descriptorIndex, "value");
@@ -1012,8 +1127,8 @@ kj::Array<kj::byte> readKvValue(lua_State* state, int descriptorIndex) {
 
 kj::Promise<kj::Array<kj::byte>> readLuaKvResponseBody(kj::Own<kj::AsyncInputStream> body) {
   KJ_IF_SOME(bodySize, body->tryGetLength()) {
-    KJ_REQUIRE(bodySize <= LuaRuntime::MAX_KV_VALUE_BYTES, "Lua KV value exceeds limit",
-        LuaRuntime::MAX_KV_VALUE_BYTES);
+    KJ_REQUIRE(bodySize <= LuaRuntime::MAX_KV_RESPONSE_BYTES, "Lua KV response exceeds limit",
+        LuaRuntime::MAX_KV_RESPONSE_BYTES);
     auto value = kj::heapArray<kj::byte>(static_cast<size_t>(bodySize));
     size_t bytesRead = 0;
     while (bytesRead < value.size()) {
@@ -1025,13 +1140,14 @@ kj::Promise<kj::Array<kj::byte>> readLuaKvResponseBody(kj::Own<kj::AsyncInputStr
   }
 
   kj::Vector<kj::byte> value;
-  while (value.size() <= LuaRuntime::MAX_KV_VALUE_BYTES) {
-    size_t maxBytes = kj::min<size_t>(16 * 1024, LuaRuntime::MAX_KV_VALUE_BYTES + 1 - value.size());
+  while (value.size() <= LuaRuntime::MAX_KV_RESPONSE_BYTES) {
+    size_t maxBytes =
+        kj::min<size_t>(16 * 1024, LuaRuntime::MAX_KV_RESPONSE_BYTES + 1 - value.size());
     auto chunk = kj::heapArray<kj::byte>(maxBytes);
     size_t bytesRead = co_await body->tryRead(chunk.begin(), 1, maxBytes);
     if (bytesRead == 0) break;
-    KJ_REQUIRE(bytesRead <= LuaRuntime::MAX_KV_VALUE_BYTES - value.size(),
-        "Lua KV value exceeds limit", LuaRuntime::MAX_KV_VALUE_BYTES);
+    KJ_REQUIRE(bytesRead <= LuaRuntime::MAX_KV_RESPONSE_BYTES - value.size(),
+        "Lua KV response exceeds limit", LuaRuntime::MAX_KV_RESPONSE_BYTES);
     value.addAll(chunk.asPtr().first(bytesRead));
   }
   co_return value.releaseAsArray();
@@ -1072,7 +1188,8 @@ kj::OneOf<kj::Duration,
     LuaRandomUuidRequest,
     LuaKvGetRequest,
     LuaKvPutRequest,
-    LuaKvDeleteRequest>
+    LuaKvDeleteRequest,
+    LuaKvListRequest>
 readHostOperation(lua_State* state) {
   KJ_REQUIRE(lua_gettop(state) == 1, "LuaJIT host operation must yield one descriptor");
   KJ_REQUIRE(lua_istable(state, -1), "LuaJIT host operation descriptor must be a table");
@@ -1122,6 +1239,13 @@ readHostOperation(lua_State* state) {
       };
     }
     return LuaKvDeleteRequest{.bindingIndex = bindingIndex, .key = kj::mv(key)};
+  }
+  if (name == "kvList") {
+    int descriptorIndex = absoluteIndex(state, -1);
+    return LuaKvListRequest{
+      .bindingIndex = readKvBindingIndex(state, descriptorIndex),
+      .options = readKvListOptions(state, descriptorIndex),
+    };
   }
   if (name == "readBody") return readBodyReadRequest(state);
   if (name == "readRequestBody") {
@@ -1397,6 +1521,18 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
             KJ_FAIL_REQUIRE("workerd.bindings KV delete() is unavailable in this context");
           }
         }
+        KJ_CASE_ONEOF(kvList, LuaKvListRequest) {
+          KJ_IF_SOME(host, hostOperations) {
+            auto response = co_await host->kvList(kvList.bindingIndex, kj::mv(kvList.options));
+            auto cacheStatus = kj::mv(response.cacheStatus);
+            auto value = co_await readLuaKvResponseBody(kj::mv(response.body));
+            const char* bytes =
+                value.size() == 0 ? "" : reinterpret_cast<const char*>(value.begin());
+            pushLuaKvListResult(coroutine, kj::StringPtr(bytes, value.size()), kj::mv(cacheStatus));
+          } else {
+            KJ_FAIL_REQUIRE("workerd.bindings KV list() is unavailable in this context");
+          }
+        }
         KJ_CASE_ONEOF(cancelRequest, LuaBodyCancelRequest) {
           KJ_REQUIRE(cancelRequest.requestId == requestId,
               "workerd.cancelBody() cannot use a stream from another request");
@@ -1659,6 +1795,39 @@ kj::Promise<void> LuaIoContext::kvDelete(size_t bindingIndex, kj::String key) {
   KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
       "Lua KV DELETE failed:", response.statusCode, response.statusText);
   co_await response.body->readAllBytes(64 * 1024).attach(kj::mv(response.body));
+}
+
+kj::Promise<LuaKvResponse> LuaIoContext::kvList(size_t bindingIndex, LuaKvListOptions options) {
+  kj::Url url;
+  url.scheme = kj::str("https");
+  url.host = kj::str("fake-host");
+  KJ_IF_SOME(limit, options.limit) {
+    if (limit > 0) {
+      url.query.add(kj::Url::QueryParam{kj::str("key_count_limit"), kj::str(limit)});
+    }
+  }
+  KJ_IF_SOME(prefix, options.prefix) {
+    url.query.add(kj::Url::QueryParam{kj::str("prefix"), kj::mv(prefix)});
+  }
+  KJ_IF_SOME(cursor, options.cursor) {
+    url.query.add(kj::Url::QueryParam{kj::str("cursor"), kj::mv(cursor)});
+  }
+  auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
+  kj::HttpHeaders headers(headerTable);
+  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
+                     .newChild(kj::ConstString(kj::str("lua.kv.list")));
+  auto client = getKvHttpClient(bindingIndex, KvOperationType::LIST, urlText, headers, tracing);
+  auto request = attachToRequest(client->request(kj::HttpMethod::GET, urlText, headers),
+      kj::Rc<kj::HttpClient>(kj::mv(client)));
+  auto response = co_await kj::mv(request.response);
+  KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
+      "Lua KV LIST failed:", response.statusCode, response.statusText);
+  kj::Maybe<kj::String> cacheStatus;
+  KJ_IF_SOME(headerId, headerTable.stringToId("cf-cache-status")) {
+    cacheStatus =
+        response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
+  }
+  co_return LuaKvResponse{.body = kj::mv(response.body), .cacheStatus = kj::mv(cacheStatus)};
 }
 
 kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {

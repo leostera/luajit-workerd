@@ -1013,6 +1013,40 @@ KJ_TEST("Server: LuaJIT KV bindings preserve configured routing and basic operat
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*missing:value)");
 }
 
+KJ_TEST("Server: LuaJIT KV list preserves configured routing and result fields") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local result = workerd.bindings.KV.list({prefix='te', limit=2, cursor='abc123'}); return {status=200, body=tostring(result.list_complete) .. ':' .. result.keys[1].name .. ':' .. tostring(result.keys[1].metadata.level) .. ':' .. result.cursor .. ':' .. result.cacheStatus} end }",
+          bindings = [(name = "KV", kvNamespace = "kv-outbound")]
+        )
+      ),
+      ( name = "kv-outbound", external = "kv-host" )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/list");
+  auto subrequest = test.receiveSubrequest("kv-host");
+  subrequest.recv(R"(
+    GET /?key_count_limit=2&prefix=te&cursor=abc123 HTTP/1.1
+    Host: fake-host
+    CF-KV-FLPROD-405: https://fake-host?key_count_limit=2&prefix=te&cursor=abc123
+
+  )"_blockquote);
+  constexpr auto json =
+      R"({"keys":[{"name":"test","metadata":"{\"level\":1}"}],"list_complete":false,"cursor":"next"})"_kj;
+  subrequest.send(kj::str(
+      "HTTP/1.1 200 OK\nContent-Length: ", json.size(), "\nCF-Cache-Status: HIT\n\n", json));
+
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*false:test:1:next:HIT)");
+}
+
 KJ_TEST("Server: LuaJIT streams Lua-produced outbound body chunks") {
   TestServer test(R"((
     services = [
