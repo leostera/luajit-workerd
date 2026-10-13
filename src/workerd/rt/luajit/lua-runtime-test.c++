@@ -337,6 +337,74 @@ KJ_TEST("LuaJIT HTTP handler receives requests and returns status, headers, and 
   KJ_EXPECT(response.headers[0].value == "x-input:received");
 }
 
+KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local config = workerd.bindings.CONFIG
+        local binary = workerd.bindings.BINARY
+        local empty = workerd.bindings.EMPTY
+        config.count = config.count + 1
+        return {
+          status = 200,
+          body = workerd.bindings.GREETING .. ":" .. tostring(#empty) .. ":" ..
+            tostring(#binary) .. ":" ..
+            tostring(binary:byte(2)) .. ":" .. tostring(config.enabled) .. ":" ..
+            tostring(config.count) .. ":" .. tostring(config.nilValue == workerd.null) .. ":" ..
+            tostring(config.list[2] == workerd.null),
+        }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("GREETING"),
+    .type = LuaBinding::Type::TEXT,
+    .text = kj::str("hello"),
+  });
+  auto binary = kj::heapArray<kj::byte>(3);
+  std::memcpy(binary.begin(), "a\0b", 3);
+  bindings.add(LuaBinding{
+    .name = kj::str("BINARY"),
+    .type = LuaBinding::Type::DATA,
+    .data = kj::mv(binary),
+  });
+  bindings.add(LuaBinding{
+    .name = kj::str("EMPTY"),
+    .type = LuaBinding::Type::DATA,
+    .data = kj::heapArray<kj::byte>(0),
+  });
+  bindings.add(LuaBinding{
+    .name = kj::str("CONFIG"),
+    .type = LuaBinding::Type::JSON,
+    .text = kj::str(R"({"enabled":true,"count":2,"nilValue":null,"list":["x",null]})"),
+  });
+
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto first = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
+  auto second = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(first.body) == "hello:0:3:0:true:3:true:true");
+  KJ_EXPECT(asString(second.body) == "hello:0:3:0:true:4:true:true");
+}
+
+KJ_TEST("LuaJIT rejects malformed JSON bindings") {
+  auto io = kj::setupAsyncIo();
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("INVALID"),
+    .type = LuaBinding::Type::JSON,
+    .text = kj::str("{ invalid json }"),
+  });
+  KJ_EXPECT(kj::runCatchingExceptions([&]() {
+    LuaRuntime runtime("return { fetch = function() return { status = 200, body = '' } end }"_kj,
+        io.provider->getTimer(), bindings.releaseAsArray());
+  }) != kj::none);
+}
+
 KJ_TEST("LuaJIT state is independent between runtime instances") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(

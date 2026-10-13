@@ -84,7 +84,7 @@ return {
 }
 ```
 
-Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, and a Lua-designed async `workerd.fetch`). Do not pass JavaScript-shaped `env` or `ctx` parameters. When named bindings are introduced, add a dedicated capability namespace/table such as `workerd.bindings`; keep it read-only where possible and make every capability's availability explicit in config.
+Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, and a Lua-designed async `workerd.fetch`). Simple text, binary-data, and JSON bindings are exposed through `workerd.bindings`; JSON `null` is represented by `workerd.null`. This preserves the `fetch(request)` signature without adding JavaScript-shaped `env` or `ctx` parameters. Binding values are installed when the service's Lua state starts and therefore share Lua's service-global mutability/lifetime. Each future capability must make its config and request-scoped availability explicit.
 
 Do not mirror JavaScript `Request`, `Response`, `Promise`, `ReadableStream`, or DOM object semantics by name unless a written Lua contract and tests establish the needed equivalence. Prefer simple Lua values and small resource wrappers with explicit close/cancel behavior.
 
@@ -96,7 +96,7 @@ The adapter does not yet reuse `IoContext::getSubrequest()` or provide an equiva
 
 ## Configuration and capability ownership
 
-- Parse the worker's bindings into typed, immutable capability descriptors during config setup; reject unsupported types before serving.
+- Parse text, data, and JSON bindings into typed descriptors during config setup; reject duplicates and unsupported types before serving. Treat service/storage, secret-derived, and cryptographic bindings separately because they require request accounting, redaction, or key-usage designs.
 - Resolve/link target services once at the service layer; create per-request call handles with fresh metadata at dispatch.
 - No Lua global should hold a request-scoped service handle. Any handle returned to Lua must either be request-bound and invalidated at completion, or be a safe config-level immutable descriptor that can only create a current-request operation.
 - Keep worker code/config and runtime state service-scoped; keep body streams, network clients, timers, trace parents, and cancellation request-scoped.

@@ -978,15 +978,47 @@ KJ_TEST("Server: LuaJIT worker rejects unsupported config") {
   )"_blockquote);
 }
 
-KJ_TEST("Server: LuaJIT worker rejects bindings") {
+KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() local b = workerd.bindings; return { status = 200, body = b.GREETING .. ':' .. tostring(b.CONFIG.enabled) .. ':' .. tostring(b.CONFIG.nilValue == workerd.null) } end }",
+    bindings = [
+      (name = "GREETING", text = "hello"),
+      (name = "CONFIG", json = "{\"enabled\":true,\"nilValue\":null}")
+    ]
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*hello:true:true)");
+}
+
+KJ_TEST("Server: LuaJIT rejects duplicate binding names") {
   TestServer test(singleWorker(R"((
     luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
-    bindings = [(name = "ignored", json = "null")]
+    bindings = [
+      (name = "same", text = "first"),
+      (name = "same", text = "second")
+    ]
   ))"_kj));
 
   test.server.allowExperimental();
   test.expectErrors(R"(
-    service hello: LuaJIT worker "hello" does not support bindings.
+    service hello: LuaJIT worker "hello" has duplicate binding name "same".
+  )"_blockquote);
+}
+
+KJ_TEST("Server: LuaJIT worker rejects unsupported bindings") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+    bindings = [(name = "ignored", service = "target")]
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.expectErrors(R"(
+    service hello: LuaJIT worker "hello" does not support binding "ignored" of this type.
   )"_blockquote);
 }
 

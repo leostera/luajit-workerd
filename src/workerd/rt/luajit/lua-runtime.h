@@ -5,8 +5,8 @@
 #pragma once
 
 #include <kj/array.h>
-#include <kj/async.h>
 #include <kj/async-io.h>
+#include <kj/async.h>
 #include <kj/compat/http.h>
 #include <kj/memory.h>
 #include <kj/string.h>
@@ -19,6 +19,20 @@
 struct lua_State;
 
 namespace workerd::rt::luajit {
+
+// A config binding copied into a Lua worker's service-global workerd.bindings table.
+struct LuaBinding {
+  enum class Type {
+    TEXT,
+    DATA,
+    JSON,
+  };
+
+  kj::String name;
+  Type type;
+  kj::String text;
+  kj::Array<kj::byte> data;
+};
 
 struct LuaHttpHeader {
   kj::String name;
@@ -66,7 +80,9 @@ class LuaRuntime final {
   // The module must return a table with a callable `fetch` field. This runtime owns one LuaJIT
   // state for its lifetime; each fetch() runs on a coroutine and yields only through host async
   // operations. Coroutine access to the shared state is serialized on the event-loop thread.
-  LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer);
+  // Bindings are parsed and installed before the module source is evaluated.
+  LuaRuntime(
+      kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<LuaBinding> bindings = nullptr);
   ~LuaRuntime() noexcept;
   KJ_DISALLOW_COPY_AND_MOVE(LuaRuntime);
 

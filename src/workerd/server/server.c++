@@ -2072,6 +2072,7 @@ class Server::LuaWorkerService final: public Service {
   LuaWorkerService(Server& server,
       kj::StringPtr name,
       kj::StringPtr source,
+      kj::Array<::workerd::rt::luajit::LuaBinding> bindings,
       config::ServiceDesignator::Reader globalOutbound,
       const kj::HttpHeaderTable& headerTable,
       kj::Timer& timer)
@@ -2079,7 +2080,7 @@ class Server::LuaWorkerService final: public Service {
         name(kj::str(name)),
         globalOutbound(globalOutbound),
         headerTable(headerTable),
-        runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer)) {}
+        runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer, kj::mv(bindings))) {}
 
   void link(Worker::ValidationErrorReporter&) override {
     outbound = server.lookupService(
@@ -5818,7 +5819,53 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
       errorReporter.addError(
           kj::str("LuaJIT workers are experimental; run workerd with `--experimental`."));
     }
-    rejectIf(conf.getBindings().size() != 0, "bindings");
+    kj::HashSet<kj::String> bindingNames;
+    kj::Vector<::workerd::rt::luajit::LuaBinding> luaBindings;
+    for (auto binding: conf.getBindings()) {
+      auto bindingName = kj::str(binding.getName());
+      if (bindingName.size() == 0) {
+        unsupportedConfig = true;
+        errorReporter.addError(kj::str("LuaJIT worker \"", name, "\" has a binding with no name."));
+        continue;
+      }
+      if (bindingNames.contains(bindingName)) {
+        unsupportedConfig = true;
+        errorReporter.addError(kj::str(
+            "LuaJIT worker \"", name, "\" has duplicate binding name \"", bindingName, "\"."));
+        continue;
+      }
+      bindingNames.insert(kj::str(bindingName));
+
+      using LuaBinding = ::workerd::rt::luajit::LuaBinding;
+      switch (binding.which()) {
+        case config::Worker::Binding::TEXT:
+          luaBindings.add(LuaBinding{
+            .name = kj::str(bindingName),
+            .type = LuaBinding::Type::TEXT,
+            .text = kj::str(binding.getText()),
+          });
+          break;
+        case config::Worker::Binding::DATA:
+          luaBindings.add(LuaBinding{
+            .name = kj::str(bindingName),
+            .type = LuaBinding::Type::DATA,
+            .data = kj::heapArray<byte>(binding.getData()),
+          });
+          break;
+        case config::Worker::Binding::JSON:
+          luaBindings.add(LuaBinding{
+            .name = kj::str(bindingName),
+            .type = LuaBinding::Type::JSON,
+            .text = kj::str(binding.getJson()),
+          });
+          break;
+        default:
+          unsupportedConfig = true;
+          errorReporter.addError(kj::str("LuaJIT worker \"", name, "\" does not support binding \"",
+              bindingName, "\" of this type."));
+          break;
+      }
+    }
     rejectIf(conf.hasCompatibilityDate() || conf.getCompatibilityFlags().size() != 0,
         "compatibility dates and flags");
     rejectIf(conf.getDurableObjectNamespaces().size() != 0 ||
@@ -5838,7 +5885,8 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     kj::Maybe<kj::Own<Service>> luaService = kj::none;
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
       luaService = kj::refcounted<LuaWorkerService>(*this, name, conf.getLuaScript(),
-          conf.getGlobalOutbound(), globalContext->headerTable, timer);
+          luaBindings.releaseAsArray(), conf.getGlobalOutbound(), globalContext->headerTable,
+          timer);
     })) {
       errorReporter.addError(
           kj::str("LuaJIT worker \"", name, "\" failed to initialize: ", exception));

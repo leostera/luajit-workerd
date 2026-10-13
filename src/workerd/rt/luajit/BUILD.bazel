@@ -14,6 +14,7 @@ wd_cc_library(
         "//src/workerd/io:worker-interface",
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj/compat:kj-http",
+        "@capnp-cpp//src/capnp/compat:json",
         "@luajit",
     ],
 )

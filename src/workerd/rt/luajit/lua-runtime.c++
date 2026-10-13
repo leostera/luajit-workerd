@@ -8,8 +8,11 @@
 
 #include <lua.hpp>
 
+#include <capnp/compat/json.h>
+#include <capnp/message.h>
 #include <kj/debug.h>
 
+#include <climits>
 #include <cstring>
 
 namespace workerd::rt::luajit {
@@ -17,6 +20,7 @@ namespace {
 
 constexpr char ASYNC_API_SOURCE[] = R"lua(
 workerd = {}
+workerd.null = setmetatable({}, { __tostring = function() return "workerd.null" end })
 
 function workerd.await(operation)
   local succeeded, value = coroutine.yield(operation)
@@ -154,6 +158,95 @@ kj::Duration readSleepDelay(lua_State* state) {
   KJ_REQUIRE(validDuration, "workerd.sleep() requires an integer duration from 0 through",
       UINT32_MAX, "milliseconds");
   return static_cast<uint32_t>(milliseconds) * kj::MILLISECONDS;
+}
+
+void pushWorkerdNull(lua_State* state) {
+  lua_getglobal(state, "workerd");
+  KJ_REQUIRE(lua_istable(state, -1), "LuaJIT workerd API table is unavailable");
+  lua_getfield(state, -1, "null");
+  lua_remove(state, -2);
+}
+
+void pushJsonValue(lua_State* state, capnp::JsonValue::Reader value, size_t depth = 0) {
+  KJ_REQUIRE(depth <= 64, "JSON binding exceeds maximum nesting depth");
+  switch (value.which()) {
+    case capnp::JsonValue::NULL_:
+      pushWorkerdNull(state);
+      return;
+    case capnp::JsonValue::BOOLEAN:
+      lua_pushboolean(state, value.getBoolean());
+      return;
+    case capnp::JsonValue::NUMBER:
+      lua_pushnumber(state, value.getNumber());
+      return;
+    case capnp::JsonValue::STRING: {
+      auto string = value.getString();
+      lua_pushlstring(state, string.begin(), string.size());
+      return;
+    }
+    case capnp::JsonValue::ARRAY: {
+      auto elements = value.getArray();
+      KJ_REQUIRE(elements.size() <= INT_MAX, "JSON array is too large for LuaJIT");
+      lua_createtable(state, static_cast<int>(elements.size()), 0);
+      size_t index = 1;
+      for (auto element: elements) {
+        pushJsonValue(state, element, depth + 1);
+        lua_rawseti(state, -2, static_cast<int>(index++));
+      }
+      return;
+    }
+    case capnp::JsonValue::OBJECT: {
+      lua_createtable(state, 0, 0);
+      for (auto field: value.getObject()) {
+        auto name = field.getName();
+        lua_pushlstring(state, name.begin(), name.size());
+        pushJsonValue(state, field.getValue(), depth + 1);
+        lua_rawset(state, -3);
+      }
+      return;
+    }
+    case capnp::JsonValue::CALL:
+    case capnp::JsonValue::RAW:
+      KJ_FAIL_REQUIRE(
+          "Lua JSON bindings do not support Cap'n Proto JSON extensions", value.which());
+  }
+  KJ_UNREACHABLE;
+}
+
+void pushLuaBindings(lua_State* state, kj::ArrayPtr<const LuaBinding> bindings) {
+  KJ_REQUIRE(bindings.size() <= INT_MAX, "too many Lua bindings");
+  lua_getglobal(state, "workerd");
+  KJ_REQUIRE(lua_istable(state, -1), "LuaJIT workerd API table is unavailable");
+  lua_createtable(state, 0, static_cast<int>(bindings.size()));
+  for (auto& binding: bindings) {
+    lua_pushlstring(state, binding.name.begin(), binding.name.size());
+    switch (binding.type) {
+      case LuaBinding::Type::TEXT:
+        lua_pushlstring(state, binding.text.begin(), binding.text.size());
+        break;
+      case LuaBinding::Type::DATA: {
+        const char* bytes =
+            binding.data.size() == 0 ? "" : reinterpret_cast<const char*>(binding.data.begin());
+        lua_pushlstring(state, bytes, binding.data.size());
+        break;
+      }
+      case LuaBinding::Type::JSON: {
+        capnp::JsonCodec codec;
+        capnp::MallocMessageBuilder arena;
+        auto root = arena.initRoot<capnp::JsonValue>();
+        KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+          codec.decodeRaw(binding.text, root);
+          pushJsonValue(state, root.asReader());
+        })) {
+          KJ_FAIL_REQUIRE("LuaJIT JSON binding", binding.name, "is invalid:", exception);
+        }
+        break;
+      }
+    }
+    lua_rawset(state, -3);
+  }
+  lua_setfield(state, -2, "bindings");
+  lua_pop(state, 1);
 }
 
 kj::Vector<LuaRuntime::Header> readHttpHeaders(lua_State* state, int tableIndex) {
@@ -350,7 +443,7 @@ void pushHttpResponse(lua_State* state,
 
 }  // namespace
 
-LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer)
+LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<LuaBinding> bindings)
     : timer(timer),
       state(luaL_newstate()),
       fetchHandlerRef(LUA_NOREF) {
@@ -368,6 +461,7 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer)
   int asyncApiEvaluationStatus = lua_pcall(state, 0, 0, 0);
   KJ_REQUIRE(asyncApiEvaluationStatus == 0,
       "failed to evaluate LuaJIT async API:", readLuaErrorMessage(state));
+  pushLuaBindings(state, bindings.asPtr());
 
   int loadStatus = luaL_loadbuffer(state, moduleSource.begin(), moduleSource.size(), "worker.lua");
   if (loadStatus != 0) {
