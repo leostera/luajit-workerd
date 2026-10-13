@@ -1,6 +1,6 @@
 # LuaJIT host-capability parity audit
 
-**Status: incomplete.** This audit extends the prior matrix audit at `98760d713` with the `RequestScope` implementation and tests committed at `7c7a49353` on `leostera/luajit`. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report summarizes verified coverage and does not upgrade partial or blocked rows into parity claims.
+**Status: incomplete.** This audit extends the prior matrix audit at `98760d713` with the shared `RequestScope` implementation (`7c7a49353`) and opt-in inbound request-body streaming (`cbb9da4b2`) on `leostera/luajit`. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report summarizes verified coverage and does not upgrade partial or blocked rows into parity claims.
 
 ## Coverage review
 
@@ -41,4 +41,4 @@ bazel build //src/workerd/server:workerd
 
 Prettier, clang-format, Buildifier, and `git diff --check` passed for the modified file set. The 45-family inventory check reported no missing, extra, or duplicate rows.
 
-Runtime/server tests cover value binding conversion and validation, cancellation and subsequent request reuse, source-aware Lua errors, trace-parent propagation, logged handler failures/500 responses, response streaming while upstream remains open, opt-in inbound body chunking and backpressure, body-size enforcement, request-handle isolation, client disconnect cancellation during inbound and outbound operations, configured outbound routing, injected subrequest rejection before dispatch, observer wrapping, unsupported event/config paths, and request interleaving. They do not cover streaming outbound request bodies or verify Cloudflare production policy/observer wiring.
+Runtime/server tests cover value binding conversion and validation, cancellation and subsequent request reuse, source-aware Lua errors, trace-parent propagation, logged handler failures/500 responses, response streaming while upstream remains open, opt-in inbound body chunking and backpressure, binary chunk preservation, partial-read errors, body-size enforcement, EOF, request-handle isolation, client disconnect cancellation during inbound and outbound operations, configured outbound routing, injected subrequest rejection before dispatch, observer wrapping, unsupported event/config paths, and request interleaving. They do not cover streaming outbound request bodies or verify Cloudflare production policy/observer wiring.
