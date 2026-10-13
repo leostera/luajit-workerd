@@ -10,7 +10,9 @@
 #include <workerd/util/uuid.h>
 
 #include <lua.hpp>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -228,6 +230,15 @@ bool equalsAsciiCaseInsensitive(const char* value, size_t valueLength, const cha
   return true;
 }
 
+const EVP_MD* findLuaDigestAlgorithm(const char* algorithm, size_t algorithmLength) {
+  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "MD5")) return EVP_md5();
+  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-1")) return EVP_sha1();
+  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-256")) return EVP_sha256();
+  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-384")) return EVP_sha384();
+  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-512")) return EVP_sha512();
+  return nullptr;
+}
+
 int digest(lua_State* state) {
   if (lua_gettop(state) != 2 || lua_type(state, 1) != LUA_TSTRING ||
       lua_type(state, 2) != LUA_TSTRING) {
@@ -236,24 +247,14 @@ int digest(lua_State* state) {
 
   size_t algorithmLength = 0;
   const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
-  const EVP_MD* digestAlgorithm = nullptr;
-  if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "MD5")) {
-    digestAlgorithm = EVP_md5();
-  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-1")) {
-    digestAlgorithm = EVP_sha1();
-  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-256")) {
-    digestAlgorithm = EVP_sha256();
-  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-384")) {
-    digestAlgorithm = EVP_sha384();
-  } else if (equalsAsciiCaseInsensitive(algorithm, algorithmLength, "SHA-512")) {
-    digestAlgorithm = EVP_sha512();
-  } else {
+  const EVP_MD* digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
+  if (digestAlgorithm == nullptr) {
     return luaL_error(state, "workerd.digest() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
   }
 
   size_t inputLength = 0;
   const char* input = lua_tolstring(state, 2, &inputLength);
-  if (inputLength > LuaRuntime::MAX_DIGEST_BYTES) {
+  if (inputLength > LuaRuntime::MAX_CRYPTO_INPUT_BYTES) {
     return luaL_error(state, "workerd.digest() input exceeds the 1048576-byte limit");
   }
 
@@ -268,6 +269,94 @@ int digest(lua_State* state) {
     return luaL_error(state, "workerd.digest() failed");
   }
   lua_pushlstring(state, reinterpret_cast<const char*>(output), outputLength);
+  return 1;
+}
+
+bool computeHmac(const EVP_MD* algorithm,
+    const char* key,
+    size_t keyLength,
+    const char* input,
+    size_t inputLength,
+    unsigned char output[64],
+    unsigned int& outputLength) {
+  int expectedOutputLength = EVP_MD_size(algorithm);
+  if (expectedOutputLength <= 0 || static_cast<size_t>(expectedOutputLength) > 64) return false;
+  auto result = HMAC(algorithm, key, static_cast<int>(keyLength),
+      reinterpret_cast<const unsigned char*>(input), inputLength, output, &outputLength);
+  return result != nullptr && outputLength == static_cast<unsigned int>(expectedOutputLength);
+}
+
+int hmac(lua_State* state) {
+  if (lua_gettop(state) != 3 || lua_type(state, 1) != LUA_TSTRING ||
+      lua_type(state, 2) != LUA_TSTRING || lua_type(state, 3) != LUA_TSTRING) {
+    return luaL_error(state, "workerd.hmac() expects an algorithm, raw key, and binary string");
+  }
+
+  size_t algorithmLength = 0;
+  const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
+  const EVP_MD* digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
+  if (digestAlgorithm == nullptr) {
+    return luaL_error(state, "workerd.hmac() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
+  }
+
+  size_t keyLength = 0;
+  const char* key = lua_tolstring(state, 2, &keyLength);
+  if (keyLength == 0 || keyLength > LuaRuntime::MAX_HMAC_KEY_BYTES) {
+    return luaL_error(state, "workerd.hmac() key must be from 1 through 65536 bytes");
+  }
+
+  size_t inputLength = 0;
+  const char* input = lua_tolstring(state, 3, &inputLength);
+  if (inputLength > LuaRuntime::MAX_CRYPTO_INPUT_BYTES) {
+    return luaL_error(state, "workerd.hmac() input exceeds the 1048576-byte limit");
+  }
+
+  unsigned char output[64];
+  unsigned int outputLength = 0;
+  if (!computeHmac(digestAlgorithm, key, keyLength, input, inputLength, output, outputLength)) {
+    return luaL_error(state, "workerd.hmac() failed");
+  }
+  lua_pushlstring(state, reinterpret_cast<const char*>(output), outputLength);
+  return 1;
+}
+
+int verifyHmac(lua_State* state) {
+  if (lua_gettop(state) != 4 || lua_type(state, 1) != LUA_TSTRING ||
+      lua_type(state, 2) != LUA_TSTRING || lua_type(state, 3) != LUA_TSTRING ||
+      lua_type(state, 4) != LUA_TSTRING) {
+    return luaL_error(
+        state, "workerd.verifyHmac() expects an algorithm, raw key, binary string, and MAC");
+  }
+
+  size_t algorithmLength = 0;
+  const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
+  const EVP_MD* digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
+  if (digestAlgorithm == nullptr) {
+    return luaL_error(
+        state, "workerd.verifyHmac() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
+  }
+
+  size_t keyLength = 0;
+  const char* key = lua_tolstring(state, 2, &keyLength);
+  if (keyLength == 0 || keyLength > LuaRuntime::MAX_HMAC_KEY_BYTES) {
+    return luaL_error(state, "workerd.verifyHmac() key must be from 1 through 65536 bytes");
+  }
+
+  size_t inputLength = 0;
+  const char* input = lua_tolstring(state, 3, &inputLength);
+  if (inputLength > LuaRuntime::MAX_CRYPTO_INPUT_BYTES) {
+    return luaL_error(state, "workerd.verifyHmac() input exceeds the 1048576-byte limit");
+  }
+
+  size_t macLength = 0;
+  const char* mac = lua_tolstring(state, 4, &macLength);
+  unsigned char output[64];
+  unsigned int outputLength = 0;
+  if (!computeHmac(digestAlgorithm, key, keyLength, input, inputLength, output, outputLength)) {
+    return luaL_error(state, "workerd.verifyHmac() failed");
+  }
+  bool valid = macLength == outputLength && CRYPTO_memcmp(output, mac, outputLength) == 0;
+  lua_pushboolean(state, valid);
   return 1;
 }
 
@@ -819,6 +908,10 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<L
   lua_setfield(state, -2, "parseUrl");
   lua_pushcfunction(state, digest);
   lua_setfield(state, -2, "digest");
+  lua_pushcfunction(state, hmac);
+  lua_setfield(state, -2, "hmac");
+  lua_pushcfunction(state, verifyHmac);
+  lua_setfield(state, -2, "verifyHmac");
   lua_pop(state, 1);
 
   int loadStatus = luaL_loadbuffer(state, moduleSource.begin(), moduleSource.size(), "worker.lua");

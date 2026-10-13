@@ -1229,6 +1229,78 @@ KJ_TEST("LuaJIT computes bounded binary-safe SHA-2 digests") {
       "59b271ae1bbcb1d31d41929817f4b16fb439eb4f31520b5ad1d5ce98920a7138:true:true:true:true:true");
 }
 
+KJ_TEST("LuaJIT computes bounded binary-safe HMAC values") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    local function toHex(bytes)
+      return (bytes:gsub(".", function(byte)
+        return string.format("%02x", byte:byte())
+      end))
+    end
+    return {
+      fetch = function()
+        local maxKey = workerd.hmac("SHA-256", string.rep("k", 65536), "")
+        local maxInput = workerd.hmac("SHA-256", "k", string.rep("a", 1048576))
+        local oversizedKey = pcall(function()
+          workerd.hmac("SHA-256", string.rep("k", 65537), "")
+        end)
+        local oversizedInput = pcall(function()
+          workerd.hmac("SHA-256", "k", string.rep("a", 1048577))
+        end)
+        local emptyKey = pcall(workerd.hmac, "SHA-256", "", "abc")
+        local unsupported = pcall(workerd.hmac, "SHA3-256", "key", "abc")
+        local wrongType = pcall(workerd.hmac, "SHA-256", "key", 123)
+        local wrongArity = pcall(workerd.hmac, "SHA-256", "key", "abc", "extra")
+        local message = "The quick brown fox jumps over the lazy dog"
+        local mac = workerd.hmac("SHA-256", "key", message)
+        local forgedMac = string.char((mac:byte(1) + 1) % 256) .. mac:sub(2)
+        local verificationWorks =
+          workerd.verifyHmac("SHA-256", "key", message, mac) and
+          not workerd.verifyHmac("SHA-256", "key", message .. "!", mac) and
+          not workerd.verifyHmac("SHA-256", "key", message, forgedMac) and
+          not workerd.verifyHmac("SHA-256", "key", message, mac:sub(2)) and
+          not pcall(workerd.verifyHmac, "SHA3-256", "key", message, mac) and
+          not pcall(workerd.verifyHmac, "SHA-256", "key", message, 123) and
+          not pcall(workerd.verifyHmac, "SHA-256", "key", message) and
+          not pcall(workerd.verifyHmac, "SHA-256", "", message, mac) and
+          not pcall(workerd.verifyHmac, "SHA-256", string.rep("k", 65537), "", mac) and
+          not pcall(workerd.verifyHmac, "SHA-256", "key", string.rep("a", 1048577), mac)
+        return {
+          status = 200,
+          body = table.concat({
+            toHex(workerd.hmac("MD5", "key", "The quick brown fox jumps over the lazy dog")),
+            toHex(workerd.hmac("SHA-1", "key", "The quick brown fox jumps over the lazy dog")),
+            toHex(workerd.hmac("sha-256", "key", "The quick brown fox jumps over the lazy dog")),
+            toHex(workerd.hmac("SHA-384", "key", "The quick brown fox jumps over the lazy dog")),
+            toHex(workerd.hmac("SHA-512", "key", "The quick brown fox jumps over the lazy dog")),
+            toHex(workerd.hmac("SHA-256", "k\0y", "a\0b")),
+            tostring(#maxKey == 32),
+            tostring(#maxInput == 32),
+            tostring(not oversizedKey),
+            tostring(not oversizedInput),
+            tostring(not emptyKey),
+            tostring(not unsupported),
+            tostring(not wrongType),
+            tostring(not wrongArity),
+            tostring(verificationWorks),
+          }, ":"),
+        }
+      end,
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/hmac"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) ==
+      "80070713463e7749b90c2dc24911e275:de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9:"
+      "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8:"
+      "d7f4727e2c0b39ae0f1e40cc96f60242d5b7801841cea6fc592c5d3e1ae50700582a96cf35e1e554995fe4e03381c237:"
+      "b42af09057bac1e2d41708e48a902e09b5ff7f12ab428a4fe86653c73dd248fb82f948a549f7b791a5b41915ee4d1ec3935357e4e2317250d0372afa2ebeeb3a:"
+      "20b3a393e9f0e606ae91954f1f871ebd5cd9c3a8f26e7b22beaed26ab4891891:true:true:true:true:true:true:true:true:true");
+}
+
 KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(
