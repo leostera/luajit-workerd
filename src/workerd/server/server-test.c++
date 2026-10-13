@@ -1259,6 +1259,11 @@ KJ_TEST("Server: LuaJIT exposes environment-derived bindings") {
 
   test.server.allowExperimental();
   test.start();
+#if _WIN32
+  _putenv("WORKERD_LUA_BINDING_PRESENT=changed after startup");
+#else
+  setenv("WORKERD_LUA_BINDING_PRESENT", "changed after startup", true);
+#endif
 
   auto conn = test.connect("test-addr");
   conn.sendHttpGet("/");
