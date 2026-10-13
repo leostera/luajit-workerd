@@ -2,6 +2,7 @@
 
 - **Status:** Exhaustive _family-level_ checklist; implementation status is updated incrementally and must not be read as symbol-by-symbol API parity.
 - **Architecture proposal:** [architecture.md](architecture.md) documents the host-operation boundary, request/coroutine ownership model, and unresolved accounting seam.
+- **Latest audit:** [final-audit.md](final-audit.md) reports verified coverage, evidence, and material remaining gaps.
 - **Source snapshot for initial audit:** workerd `8548f49da652625d8d7d1db84cbd868f85e0dc4f` (`leostera/luajit`), audited 2026-10-13. Re-audit the current branch head before completion.
 - **Goal:** Track workerd host capabilities available to JS workers and decide which have meaningful Lua equivalents. This is not an ECMAScript/V8 semantic checklist or a symbol-by-symbol inventory of every JSG member.
 - **Contract:** Keep the Lua module-returned `{ fetch = function(request) ... end }` shape. Do not add `env`/`ctx` arguments. Lua remains experimental and trusted-code-only; no sandbox claim.
