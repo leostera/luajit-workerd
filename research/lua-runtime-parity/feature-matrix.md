@@ -1,6 +1,7 @@
 # workerd LuaJIT host-capability parity matrix
 
 - **Status:** Initial exhaustive _family-level_ audit; implementation not started from this matrix yet.
+- **Architecture proposal:** [architecture.md](architecture.md) documents the proposed host-operation boundary and request/coroutine ownership model.
 - **Source snapshot:** workerd `8548f49da652625d8d7d1db84cbd868f85e0dc4f` (`leostera/luajit`), audited 2026-10-13.
 - **Goal:** Track workerd host capabilities available to JS workers and decide which have meaningful Lua equivalents. This is not an ECMAScript/V8 semantic checklist or a symbol-by-symbol inventory of every JSG member.
 - **Contract:** Keep the Lua module-returned `{ fetch = function(request) ... end }` shape. Do not add `env`/`ctx` arguments. Lua remains experimental and trusted-code-only; no sandbox claim.
