@@ -33,6 +33,59 @@ class InertSubrequestChannel final: public IoChannelFactory::SubrequestChannel {
   }
 };
 
+class TraceObservation final: public kj::Refcounted {
+ public:
+  kj::Vector<kj::String> operationNames;
+};
+
+class RecordingSpanObserver final: public SpanObserver {
+ public:
+  explicit RecordingSpanObserver(kj::Rc<TraceObservation> observation)
+      : observation(kj::mv(observation)) {}
+
+  kj::Rc<SpanObserver> newChild() override {
+    return kj::rc<RecordingSpanObserver>(observation.addRef());
+  }
+
+  void onOpen(kj::ConstString operationName, kj::Date startTime) override {
+    observation->operationNames.add(kj::str(operationName));
+  }
+
+  void onClose(kj::Date endTime, Span::TagMap&& tags, kj::Vector<Span::Log>&& logs) override {}
+
+  kj::Maybe<tracing::SpanContext> toSpanContext() override {
+    return tracing::SpanContext(tracing::TraceId(0x1234, 0x5678), tracing::SpanId(0x9));
+  }
+
+  tracing::SpanId getSpanId() override {
+    return tracing::SpanId(0x9);
+  }
+
+ private:
+  kj::Rc<TraceObservation> observation;
+};
+
+class RecordingSubrequestChannel final: public IoChannelFactory::SubrequestChannel {
+ public:
+  void requireAllowsTransfer() override {}
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    KJ_UNREACHABLE;
+  }
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    cfBlobJson = metadata.cfBlobJson.map([](const kj::String& value) { return kj::str(value); });
+    parentContext = metadata.parentSpan.toSpanContext();
+    userParentContext = metadata.userSpanParent.toSpanContext();
+    return WorkerInterface::fromException(KJ_EXCEPTION(FAILED, "mock subrequest failure"));
+  }
+
+  kj::Maybe<kj::String> cfBlobJson;
+  kj::Maybe<tracing::SpanContext> parentContext;
+  kj::Maybe<tracing::SpanContext> userParentContext;
+};
+
 class TestLuaHostOperations final: public LuaHostOperations {
  public:
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
@@ -141,7 +194,10 @@ KJ_TEST("LuaJIT cancels a suspended outbound operation with its request") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(
     return {
-      fetch = function()
+      fetch = function(request)
+        if request.url == "/fast" then
+          return { status = 200, body = "reused" }
+        end
         workerd.fetch({ url = "https://example.com/pending" })
         return { status = 200, body = "unexpected" }
       end
@@ -152,11 +208,15 @@ KJ_TEST("LuaJIT cancels a suspended outbound operation with its request") {
   CancelableLuaHostOperations hostOperations;
   kj::HttpHeaderTable headerTable;
   kj::HttpHeaders headers(headerTable);
-  auto request = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, hostOperations.getPtr());
+  auto request = runtime.fetch("GET"_kj, "/pending"_kj, headers, nullptr, hostOperations.getPtr());
 
   KJ_EXPECT(!request.poll(io.waitScope));
   request = nullptr;
   KJ_EXPECT(hostOperations.canceled);
+
+  auto nextRequest = runtime.fetch("GET"_kj, "/fast"_kj, headers, nullptr, hostOperations.getPtr())
+                         .wait(io.waitScope);
+  KJ_EXPECT(asString(nextRequest.body) == "reused");
 }
 
 KJ_TEST("LuaJIT outbound fetch failures become catchable Lua errors") {
@@ -318,6 +378,52 @@ KJ_TEST("LuaJIT can issue multiple outbound fetches in one request") {
   hostOperations.complete(1, "second");
   auto response = request.wait(io.waitScope);
   KJ_EXPECT(asString(response.body) == "first:second");
+}
+
+KJ_TEST("LuaJIT outbound fetch propagates request trace context") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded = pcall(function()
+          workerd.fetch({ url = "https://example.com/trace" })
+        end)
+        return { status = 200, body = tostring(succeeded) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto observation = kj::rc<TraceObservation>();
+  auto spanObserver = kj::rc<RecordingSpanObserver>(observation.addRef());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  IoChannelFactory::SubrequestMetadata metadata;
+  metadata.cfBlobJson = kj::str("request-cf-blob");
+  metadata.parentSpan = SpanParent(spanObserver.addRef());
+  metadata.userSpanParent = SpanParent(spanObserver.addRef());
+  LuaWorkerInterface host(runtime, *outbound, headerTable, kj::mv(metadata));
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "false");
+  KJ_IF_SOME(cfBlobJson, outbound->cfBlobJson) {
+    KJ_EXPECT(cfBlobJson == "request-cf-blob");
+  } else {
+    KJ_FAIL_ASSERT("outbound request must preserve cfBlobJson");
+  }
+  KJ_REQUIRE(outbound->parentContext != kj::none);
+  KJ_REQUIRE(outbound->userParentContext != kj::none);
+  KJ_EXPECT(
+      KJ_ASSERT_NONNULL(outbound->parentContext).getTraceId() == tracing::TraceId(0x1234, 0x5678));
+  KJ_EXPECT(KJ_ASSERT_NONNULL(outbound->parentContext).getSpanId() == tracing::SpanId(0x9));
+  KJ_EXPECT(KJ_ASSERT_NONNULL(outbound->userParentContext).getTraceId() ==
+      tracing::TraceId(0x1234, 0x5678));
+  KJ_EXPECT(observation->operationNames.size() == 2);
+  KJ_EXPECT(observation->operationNames[0] == "lua.fetch");
+  KJ_EXPECT(observation->operationNames[1] == "lua.fetch");
 }
 
 KJ_TEST("LuaJIT worker rejects scheduled and alarm events") {
@@ -532,9 +638,14 @@ KJ_TEST("LuaJIT rejects invalid modules and handler results") {
 
   LuaRuntime thrownError(
       R"lua(return { fetch = function() error("handler failed") end })lua"_kj, timer);
-  KJ_EXPECT(kj::runCatchingExceptions([&]() {
+  KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
     (void)thrownError.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
-  }) != kj::none);
+  })) {
+    KJ_EXPECT(exception.getDescription().contains("handler failed"));
+    KJ_EXPECT(exception.getDescription().contains("worker.lua"));
+  } else {
+    KJ_FAIL_ASSERT("Lua handler error should fail the request");
+  }
 }
 
 }  // namespace

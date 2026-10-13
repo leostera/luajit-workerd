@@ -833,6 +833,25 @@ KJ_TEST("Server: serve LuaJIT HTTP worker selected from config") {
             "lua:http://foo/lua");
 }
 
+KJ_TEST("Server: LuaJIT handler errors are logged and return 500") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() error('lua handler marker') end }"
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  KJ_EXPECT_LOG(ERROR, "Uncaught exception");
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recv(R"(
+    HTTP/1.1 500 Internal Server Error
+    Connection: close
+    Content-Length: 21
+
+    Internal Server Error)"_blockquote);
+}
+
 KJ_TEST("Server: LuaJIT fetch uses a custom global outbound service") {
   TestServer test(R"((
     services = [
