@@ -950,7 +950,7 @@ KJ_TEST("Server: LuaJIT streams request bodies through outbound fetch") {
   conn.send("POST /upload HTTP/1.1\nHost: foo\nContent-Length: 6\n\nabc");
   auto subrequest = test.receiveSubrequest("proxy-host");
   subrequest.recvRegex(
-      R"(POST https://example\.com/upload HTTP/1\.1[\s\S]*Transfer-Encoding: chunked[\s\S]*3\nabc\n)");
+      R"(POST https://example\.com/upload HTTP/1\.1\nTransfer-Encoding: chunked\n\n3\nabc\n)");
 
   conn.send("def");
   subrequest.recvRegex(R"(3\ndef\n0\n\n)");
