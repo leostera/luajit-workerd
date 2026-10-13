@@ -33,10 +33,14 @@ class LuaIoContext final: public LuaHostOperations {
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
   bool hasRequestBodyStream() const override;
   kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override;
-  kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override;
-  kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override;
+  kj::Promise<LuaKvGetResponse> kvGet(
+      size_t bindingIndex, kj::String key, LuaKvGetOptions options, LuaKvGetMode mode) override;
+  kj::Promise<void> kvPut(size_t bindingIndex,
+      kj::String key,
+      kj::Array<kj::byte> value,
+      LuaKvPutOptions options) override;
   kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) override;
-  kj::Promise<LuaKvResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override;
+  kj::Promise<LuaKvListResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override;
   void fillRandomBytes(kj::ArrayPtr<kj::byte> output) override;
   kj::String generateRandomUuid() override;
   kj::Maybe<kj::String> getRequestCfJson() const override;

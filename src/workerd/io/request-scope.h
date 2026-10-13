@@ -29,6 +29,7 @@ class SubrequestLimitPolicy {
 // The operation class used for a KV request's separate quota accounting.
 enum class KvOperationType {
   GET,
+  GET_WITH,
   PUT,
   DELETE,
   LIST,

@@ -84,6 +84,7 @@ class SubrequestAccountingState final: public kj::Refcounted {
   SubrequestType lastType = SubrequestType::EXTERNAL;
   bool rejectSubrequest = false;
   size_t kvAdmissionCalls = 0;
+  kj::Vector<KvOperationType> kvOperations;
   KvOperationType lastKvOperation = KvOperationType::GET;
   bool rejectKvOperation = false;
   size_t observerCalls = 0;
@@ -112,6 +113,7 @@ class RecordingKvOperationLimitPolicy final: public KvOperationLimitPolicy {
 
   void checkKvOperation(KvOperationType operation) override {
     ++state->kvAdmissionCalls;
+    state->kvOperations.add(operation);
     state->lastKvOperation = operation;
     KJ_REQUIRE(!state->rejectKvOperation, "KV operation rejected by request scope");
   }
@@ -195,11 +197,15 @@ class LuaHostOperationsWithoutRequestBody: public LuaHostOperations {
     KJ_FAIL_REQUIRE("mock does not provide an inbound request body stream");
   }
 
-  kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override {
+  kj::Promise<LuaKvGetResponse> kvGet(
+      size_t bindingIndex, kj::String key, LuaKvGetOptions options, LuaKvGetMode mode) override {
     KJ_FAIL_REQUIRE("mock does not provide KV get()", bindingIndex, key);
   }
 
-  kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override {
+  kj::Promise<void> kvPut(size_t bindingIndex,
+      kj::String key,
+      kj::Array<kj::byte> value,
+      LuaKvPutOptions options) override {
     KJ_FAIL_REQUIRE("mock does not provide KV put()", bindingIndex, key);
   }
 
@@ -207,7 +213,7 @@ class LuaHostOperationsWithoutRequestBody: public LuaHostOperations {
     KJ_FAIL_REQUIRE("mock does not provide KV delete()", bindingIndex, key);
   }
 
-  kj::Promise<LuaKvResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override {
+  kj::Promise<LuaKvListResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override {
     KJ_FAIL_REQUIRE("mock does not provide KV list()", bindingIndex);
   }
 };
@@ -232,23 +238,52 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
     return requestCfJson.map([](const kj::String& value) { return kj::str(value); });
   }
 
-  kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override {
+  kj::Promise<LuaKvGetResponse> kvGet(
+      size_t bindingIndex, kj::String key, LuaKvGetOptions options, LuaKvGetMode mode) override {
     ++kvGetCalls;
     KJ_REQUIRE(bindingIndex == 0 && key == "lookup", "unexpected KV get request");
-    if (kvGetMissing) co_return kj::none;
+    KJ_REQUIRE(mode == kvGetExpectedMode, "unexpected KV get mode");
+    if (kvGetCacheTtlExpected) {
+      KJ_IF_SOME(cacheTtl, options.cacheTtl) {
+        KJ_REQUIRE(cacheTtl == 120, "unexpected KV get cacheTtl");
+      } else {
+        KJ_FAIL_REQUIRE("KV get cacheTtl was not passed");
+      }
+    }
+    if (kvGetMissing) co_return LuaKvGetResponse{.cacheStatus = kj::str("MISS")};
     if (kvGetOversizedResponse) {
       auto value = kj::heapArray<kj::byte>(LuaRuntime::MAX_KV_RESPONSE_BYTES + 1);
-      co_return LuaKvResponse{.body = newMemoryInputStream(kj::mv(value))};
+      co_return LuaKvGetResponse{.body = newMemoryInputStream(kj::mv(value))};
     }
     static constexpr kj::byte value[] = {0, 255, 65};
-    co_return LuaKvResponse{.body = newMemoryInputStream(kj::arrayPtr(value))};
+    co_return LuaKvGetResponse{
+      .body = newMemoryInputStream(kj::arrayPtr(value)),
+      .metadata = kj::str(R"({"source":"runtime"})"),
+      .cacheStatus = kj::str("HIT"),
+    };
   }
 
-  kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override {
+  kj::Promise<void> kvPut(size_t bindingIndex,
+      kj::String key,
+      kj::Array<kj::byte> value,
+      LuaKvPutOptions options) override {
     ++kvPutCalls;
     KJ_REQUIRE(bindingIndex == 0 && key == "stored", "unexpected KV put request");
     KJ_REQUIRE(value.size() == 3 && value[0] == 0 && value[1] == 255 && value[2] == 65,
         "unexpected KV put value");
+    if (kvPutOptionsExpected && kvPutCalls == 1) {
+      KJ_IF_SOME(expirationTtl, options.expirationTtl) {
+        KJ_REQUIRE(expirationTtl == 120, "unexpected KV put expirationTtl");
+      } else {
+        KJ_FAIL_REQUIRE("KV put expirationTtl was not passed");
+      }
+    } else if (kvPutOptionsExpected && kvPutCalls == 2) {
+      KJ_IF_SOME(expiration, options.expiration) {
+        KJ_REQUIRE(expiration == 2'000'000'000, "unexpected KV put expiration");
+      } else {
+        KJ_FAIL_REQUIRE("KV put expiration was not passed");
+      }
+    }
     co_return;
   }
 
@@ -258,7 +293,7 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
     co_return;
   }
 
-  kj::Promise<LuaKvResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override {
+  kj::Promise<LuaKvListResponse> kvList(size_t bindingIndex, LuaKvListOptions options) override {
     ++kvListCalls;
     KJ_REQUIRE(bindingIndex == 0, "unexpected KV list binding");
     KJ_IF_SOME(limit, options.limit) {
@@ -277,11 +312,11 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
       KJ_FAIL_REQUIRE("KV list cursor was not passed");
     }
     if (kvListInvalidResponse) {
-      co_return LuaKvResponse{
+      co_return LuaKvListResponse{
         .body = newMemoryInputStream(R"({"keys":[],"list_complete":"false"})"_kj),
       };
     }
-    co_return LuaKvResponse{
+    co_return LuaKvListResponse{
       .body = newMemoryInputStream(
           R"({"keys":[{"name":"test","expiration":123,"metadata":"{\"id\":1}"},{"name":"null-meta","metadata":"null"}],"list_complete":false,"cursor":"next"})"_kj),
       .cacheStatus = kj::str("HIT"),
@@ -322,9 +357,12 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   size_t randomUuidCalls = 0;
   size_t kvGetCalls = 0;
   size_t kvPutCalls = 0;
+  bool kvPutOptionsExpected = false;
   size_t kvDeleteCalls = 0;
   size_t kvListCalls = 0;
   bool kvListInvalidResponse = false;
+  bool kvGetCacheTtlExpected = false;
+  LuaKvGetMode kvGetExpectedMode = LuaKvGetMode::VALUE;
   bool kvGetMissing = false;
   bool kvGetOversizedResponse = false;
 };
@@ -375,10 +413,13 @@ KJ_TEST("LuaJIT KV namespace methods yield through host operations") {
       fetch = function()
         local value = workerd.bindings.KV.get("lookup")
         local binary = value == string.char(0, 255, 65)
-        local putResult = workerd.bindings.KV.put("stored", string.char(0, 255, 65))
+        local putResult = workerd.bindings.KV.put(
+          "stored", string.char(0, 255, 65), {expirationTtl = 120})
+        local expirationResult = workerd.bindings.KV.put(
+          "stored", string.char(0, 255, 65), {expiration = 2000000000})
         local deleteResult = workerd.bindings.KV.delete("removed")
         return { status = 200, body = tostring(binary) .. ":" .. tostring(putResult == nil) .. ":" ..
-          tostring(deleteResult == nil) }
+          tostring(expirationResult == nil) .. ":" .. tostring(deleteResult == nil) }
       end
     }
   )lua"_kj;
@@ -391,15 +432,16 @@ KJ_TEST("LuaJIT KV namespace methods yield through host operations") {
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
+  host.kvPutOptionsExpected = true;
   kj::HttpHeaderTable headerTable;
   kj::HttpHeaders headers(headerTable);
 
   auto response =
       runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
 
-  KJ_EXPECT(asString(response.body) == "true:true:true");
+  KJ_EXPECT(asString(response.body) == "true:true:true:true");
   KJ_EXPECT(host.kvGetCalls == 1);
-  KJ_EXPECT(host.kvPutCalls == 1);
+  KJ_EXPECT(host.kvPutCalls == 2);
   KJ_EXPECT(host.kvDeleteCalls == 1);
 }
 
@@ -429,6 +471,74 @@ KJ_TEST("LuaJIT KV missing entries return nil") {
       runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
 
   KJ_EXPECT(asString(response.body) == "true");
+  KJ_EXPECT(host.kvGetCalls == 1);
+}
+
+KJ_TEST("LuaJIT KV getWithMetadata returns binary values and decoded metadata") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local result = workerd.bindings.KV.getWithMetadata("lookup", {cacheTtl = 120})
+        return { status = 200, body = table.concat({
+          tostring(result.value == string.char(0, 255, 65)), result.metadata.source,
+          result.cacheStatus,
+        }, ":") }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  host.kvGetCacheTtlExpected = true;
+  host.kvGetExpectedMode = LuaKvGetMode::WITH_METADATA;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "true:runtime:HIT");
+  KJ_EXPECT(host.kvGetCalls == 1);
+}
+
+KJ_TEST("LuaJIT KV getWithMetadata represents missing fields explicitly") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local result = workerd.bindings.KV.getWithMetadata("lookup")
+        return { status = 200, body = table.concat({
+          tostring(result.value == workerd.null), tostring(result.metadata == workerd.null),
+          result.cacheStatus,
+        }, ":") }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  host.kvGetMissing = true;
+  host.kvGetExpectedMode = LuaKvGetMode::WITH_METADATA;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "true:true:MISS");
   KJ_EXPECT(host.kvGetCalls == 1);
 }
 
@@ -1319,6 +1429,9 @@ KJ_TEST("LuaJIT KV bindings preserve operation and in-house subrequest accountin
         local getFailure = pcall(function() workerd.bindings.KV.get("key") end)
         local putFailure = pcall(function() workerd.bindings.KV.put("key", "value") end)
         local deleteFailure = pcall(function() workerd.bindings.KV.delete("key") end)
+        local getWithMetadataFailure = pcall(function()
+          workerd.bindings.KV.getWithMetadata("key")
+        end)
         local listFailure = pcall(function() workerd.bindings.KV.list() end)
         local invalidListLimit = pcall(function() workerd.bindings.KV.list({limit = 1001}) end)
         local invalidPrefix = pcall(function()
@@ -1328,17 +1441,49 @@ KJ_TEST("LuaJIT KV bindings preserve operation and in-house subrequest accountin
           workerd.bindings.KV.list({cursor = string.rep("c", 4097)})
         end)
         local invalidListOptions = pcall(function() workerd.bindings.KV.list("bad") end)
+        local unsupportedListOption = pcall(function()
+          workerd.bindings.KV.list({cacheTtl = 60})
+        end)
+        local invalidGetCacheTtl = pcall(function()
+          workerd.bindings.KV.get("key", {cacheTtl = 59})
+        end)
+        local invalidGetCacheTtlType = pcall(function()
+          workerd.bindings.KV.get("key", {cacheTtl = 60.5})
+        end)
+        local unsupportedGetOption = pcall(function()
+          workerd.bindings.KV.get("key", {type = "json"})
+        end)
         local invalidKey = pcall(function() workerd.bindings.KV.get("") end)
         local invalidSpecialKey = pcall(function() workerd.bindings.KV.get("..") end)
         local oversizedKey = pcall(function() workerd.bindings.KV.get(string.rep("k", 513)) end)
         local oversizedValue = pcall(function()
           workerd.bindings.KV.put("key", string.rep("v", 1024 * 1024 + 1))
         end)
+        local invalidPutExpirationTtl = pcall(function()
+          workerd.bindings.KV.put("key", "value", {expirationTtl = 59})
+        end)
+        local invalidPutExpirationTtlType = pcall(function()
+          workerd.bindings.KV.put("key", "value", {expirationTtl = 60.5})
+        end)
+        local invalidPutExpiration = pcall(function()
+          workerd.bindings.KV.put("key", "value", {expiration = -1})
+        end)
+        local invalidPutExpirationType = pcall(function()
+          workerd.bindings.KV.put("key", "value", {expiration = 1.5})
+        end)
+        local unsupportedPutOptions = pcall(function()
+          workerd.bindings.KV.put("key", "value", {metadata = {id = 1}})
+        end)
         return { status = 200, body = table.concat({tostring(getFailure), tostring(putFailure),
-          tostring(deleteFailure), tostring(listFailure), tostring(invalidListLimit),
+          tostring(deleteFailure), tostring(getWithMetadataFailure), tostring(listFailure),
+          tostring(invalidListLimit),
           tostring(invalidPrefix), tostring(invalidCursor), tostring(invalidListOptions),
+          tostring(unsupportedListOption), tostring(invalidGetCacheTtl),
+          tostring(invalidGetCacheTtlType), tostring(unsupportedGetOption),
+          tostring(invalidPutExpirationTtl), tostring(invalidPutExpirationTtlType),
+          tostring(invalidPutExpiration), tostring(invalidPutExpirationType),
           tostring(invalidKey), tostring(invalidSpecialKey), tostring(oversizedKey),
-          tostring(oversizedValue)}, ":") }
+          tostring(oversizedValue), tostring(unsupportedPutOptions)}, ":") }
       end
     }
   )lua"_kj;
@@ -1368,13 +1513,18 @@ KJ_TEST("LuaJIT KV bindings preserve operation and in-house subrequest accountin
       runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
 
   KJ_EXPECT(asString(response.body) ==
-      "false:false:false:false:false:false:false:false:false:false:false:false");
-  KJ_EXPECT(accounting->kvAdmissionCalls == 4);
+      "false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false:false");
+  KJ_EXPECT(accounting->kvAdmissionCalls == 5);
+  KJ_EXPECT(accounting->kvOperations[0] == KvOperationType::GET);
+  KJ_EXPECT(accounting->kvOperations[1] == KvOperationType::PUT);
+  KJ_EXPECT(accounting->kvOperations[2] == KvOperationType::DELETE);
+  KJ_EXPECT(accounting->kvOperations[3] == KvOperationType::GET_WITH);
+  KJ_EXPECT(accounting->kvOperations[4] == KvOperationType::LIST);
   KJ_EXPECT(accounting->lastKvOperation == KvOperationType::LIST);
-  KJ_EXPECT(accounting->admissionCalls == 4);
+  KJ_EXPECT(accounting->admissionCalls == 5);
   KJ_EXPECT(accounting->lastType == SubrequestType::IN_HOUSE);
   KJ_EXPECT(accounting->observerCalls == 0);
-  KJ_EXPECT(kvChannelPtr->requestsStarted == 4);
+  KJ_EXPECT(kvChannelPtr->requestsStarted == 5);
   KJ_EXPECT(kvChannelPtr->cfBlobJson == kj::none);
   KJ_EXPECT(outbound->requestsStarted == 0);
 }

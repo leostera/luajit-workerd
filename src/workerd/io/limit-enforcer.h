@@ -139,6 +139,9 @@ class LimitEnforcer: public SubrequestLimitPolicy, public KvOperationLimitPolicy
       case KvOperationType::GET:
         newKvRequest(KvOpType::GET);
         break;
+      case KvOperationType::GET_WITH:
+        newKvRequest(KvOpType::GET_WITH);
+        break;
       case KvOperationType::PUT:
         newKvRequest(KvOpType::PUT);
         break;

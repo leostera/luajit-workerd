@@ -73,14 +73,43 @@ end
 
 function workerd.createKvNamespace(kvBindingIndex)
   return {
-    get = function(key)
+    get = function(key, options)
       if type(key) ~= "string" then error("KV get() requires a string key", 2) end
-      return workerd.await({ operation = "kvGet", kvBindingIndex = kvBindingIndex, key = key })
+      if options ~= nil and type(options) ~= "table" then
+        error("KV get() options must be a table", 2)
+      end
+      return workerd.await({
+        operation = "kvGet",
+        kvBindingIndex = kvBindingIndex,
+        key = key,
+        options = options,
+      })
     end,
-    put = function(key, value)
+    getWithMetadata = function(key, options)
+      if type(key) ~= "string" then error("KV getWithMetadata() requires a string key", 2) end
+      if options ~= nil and type(options) ~= "table" then
+        error("KV getWithMetadata() options must be a table", 2)
+      end
+      return workerd.await({
+        operation = "kvGetWithMetadata",
+        kvBindingIndex = kvBindingIndex,
+        key = key,
+        options = options,
+      })
+    end,
+    put = function(key, value, options)
       if type(key) ~= "string" then error("KV put() requires a string key", 2) end
       if type(value) ~= "string" then error("KV put() requires a string value", 2) end
-      return workerd.await({ operation = "kvPut", kvBindingIndex = kvBindingIndex, key = key, value = value })
+      if options ~= nil and type(options) ~= "table" then
+        error("KV put() options must be a table", 2)
+      end
+      return workerd.await({
+        operation = "kvPut",
+        kvBindingIndex = kvBindingIndex,
+        key = key,
+        value = value,
+        options = options,
+      })
     end,
     delete = function(key)
       if type(key) ~= "string" then error("KV delete() requires a string key", 2) end
@@ -1019,12 +1048,15 @@ struct LuaRandomUuidRequest {};
 struct LuaKvGetRequest {
   size_t bindingIndex;
   kj::String key;
+  LuaKvGetOptions options;
+  LuaKvGetMode mode;
 };
 
 struct LuaKvPutRequest {
   size_t bindingIndex;
   kj::String key;
   kj::Array<kj::byte> value;
+  LuaKvPutOptions options;
 };
 
 struct LuaKvDeleteRequest {
@@ -1067,6 +1099,88 @@ kj::String readKvKey(lua_State* state, int descriptorIndex, const char* operatio
   return kj::heapString(key, length);
 }
 
+void validateKvOptionFields(lua_State* state,
+    int optionsIndex,
+    const char* operation,
+    kj::ArrayPtr<const char*> supportedFields) {
+  optionsIndex = absoluteIndex(state, optionsIndex);
+  lua_pushnil(state);
+  while (lua_next(state, optionsIndex) != 0) {
+    KJ_REQUIRE(lua_type(state, -2) == LUA_TSTRING, "workerd.bindings KV", operation,
+        " options must use string field names");
+    size_t keySize = 0;
+    const char* key = lua_tolstring(state, -2, &keySize);
+    kj::StringPtr keyName(key, keySize);
+    bool supported = false;
+    for (const char* field: supportedFields) {
+      supported = supported || keyName == field;
+    }
+    KJ_REQUIRE(supported, "unsupported workerd.bindings KV", operation, " option", keyName);
+    lua_pop(state, 1);
+  }
+}
+
+LuaKvGetOptions readKvGetOptions(lua_State* state, int descriptorIndex, const char* operation) {
+  descriptorIndex = absoluteIndex(state, descriptorIndex);
+  LuaStackGuard stackGuard(state);
+  getRawField(state, descriptorIndex, "options");
+  if (lua_type(state, -1) == LUA_TNIL) return {};
+  KJ_REQUIRE(lua_istable(state, -1), "KV", operation, " options must be a table");
+  int optionsIndex = absoluteIndex(state, -1);
+  const char* supportedFields[] = {"cacheTtl"};
+  validateKvOptionFields(state, optionsIndex, operation, supportedFields);
+
+  LuaKvGetOptions options;
+  getRawField(state, optionsIndex, "cacheTtl");
+  if (lua_type(state, -1) != LUA_TNIL) {
+    int isNumber = 0;
+    lua_Integer cacheTtl = lua_tointegerx(state, -1, &isNumber);
+    bool validCacheTtl = lua_type(state, -1) == LUA_TNUMBER && isNumber && cacheTtl >= 60 &&
+        cacheTtl <= INT_MAX && static_cast<lua_Number>(cacheTtl) == lua_tonumber(state, -1);
+    KJ_REQUIRE(
+        validCacheTtl, "KV", operation, " cacheTtl must be an integer of at least 60 seconds");
+    options.cacheTtl = static_cast<uint32_t>(cacheTtl);
+  }
+  lua_pop(state, 1);
+  return options;
+}
+
+LuaKvPutOptions readKvPutOptions(lua_State* state, int descriptorIndex) {
+  descriptorIndex = absoluteIndex(state, descriptorIndex);
+  LuaStackGuard stackGuard(state);
+  getRawField(state, descriptorIndex, "options");
+  if (lua_type(state, -1) == LUA_TNIL) return {};
+  KJ_REQUIRE(lua_istable(state, -1), "KV put() options must be a table");
+  int optionsIndex = absoluteIndex(state, -1);
+  const char* supportedFields[] = {"expiration", "expirationTtl"};
+  validateKvOptionFields(state, optionsIndex, "put", supportedFields);
+
+  LuaKvPutOptions options;
+  getRawField(state, optionsIndex, "expiration");
+  if (lua_type(state, -1) != LUA_TNIL) {
+    int isNumber = 0;
+    lua_Integer expiration = lua_tointegerx(state, -1, &isNumber);
+    bool validExpiration = lua_type(state, -1) == LUA_TNUMBER && isNumber && expiration >= 0 &&
+        expiration <= INT_MAX && static_cast<lua_Number>(expiration) == lua_tonumber(state, -1);
+    KJ_REQUIRE(validExpiration, "KV put() expiration must be an integer from 0 through", INT_MAX);
+    options.expiration = static_cast<uint32_t>(expiration);
+  }
+  lua_pop(state, 1);
+  getRawField(state, optionsIndex, "expirationTtl");
+  if (lua_type(state, -1) != LUA_TNIL) {
+    int isNumber = 0;
+    lua_Integer expirationTtl = lua_tointegerx(state, -1, &isNumber);
+    bool validExpirationTtl = lua_type(state, -1) == LUA_TNUMBER && isNumber &&
+        expirationTtl >= 60 && expirationTtl <= INT_MAX &&
+        static_cast<lua_Number>(expirationTtl) == lua_tonumber(state, -1);
+    KJ_REQUIRE(
+        validExpirationTtl, "KV put() expirationTtl must be an integer from 60 through", INT_MAX);
+    options.expirationTtl = static_cast<uint32_t>(expirationTtl);
+  }
+  lua_pop(state, 1);
+  return options;
+}
+
 kj::Maybe<kj::String> readOptionalKvListString(
     lua_State* state, int optionsIndex, const char* fieldName, size_t maxLength) {
   getRawField(state, optionsIndex, fieldName);
@@ -1089,6 +1203,8 @@ LuaKvListOptions readKvListOptions(lua_State* state, int descriptorIndex) {
   if (lua_type(state, -1) == LUA_TNIL) return {};
   KJ_REQUIRE(lua_istable(state, -1), "KV list() options must be a table");
   int optionsIndex = absoluteIndex(state, -1);
+  const char* supportedFields[] = {"limit", "prefix", "cursor"};
+  validateKvOptionFields(state, optionsIndex, "list", supportedFields);
 
   LuaKvListOptions options;
   getRawField(state, optionsIndex, "limit");
@@ -1223,19 +1339,27 @@ readHostOperation(lua_State* state) {
     lua_pop(state, 1);
     return kj::mv(request);
   }
-  if (name == "kvGet" || name == "kvPut" || name == "kvDelete") {
+  if (name == "kvGet" || name == "kvGetWithMetadata" || name == "kvPut" || name == "kvDelete") {
     int descriptorIndex = absoluteIndex(state, -1);
     auto bindingIndex = readKvBindingIndex(state, descriptorIndex);
     auto key = readKvKey(state, descriptorIndex, name.begin());
-    if (name == "kvGet") {
-      return LuaKvGetRequest{.bindingIndex = bindingIndex, .key = kj::mv(key)};
+    if (name == "kvGet" || name == "kvGetWithMetadata") {
+      return LuaKvGetRequest{
+        .bindingIndex = bindingIndex,
+        .key = kj::mv(key),
+        .options =
+            readKvGetOptions(state, descriptorIndex, name == "kvGet" ? "get" : "getWithMetadata"),
+        .mode = name == "kvGet" ? LuaKvGetMode::VALUE : LuaKvGetMode::WITH_METADATA,
+      };
     }
     if (name == "kvPut") {
+      auto options = readKvPutOptions(state, descriptorIndex);
       auto value = readKvValue(state, descriptorIndex);
       return LuaKvPutRequest{
         .bindingIndex = bindingIndex,
         .key = kj::mv(key),
         .value = kj::mv(value),
+        .options = kj::mv(options),
       };
     }
     return LuaKvDeleteRequest{.bindingIndex = bindingIndex, .key = kj::mv(key)};
@@ -1493,13 +1617,46 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
         }
         KJ_CASE_ONEOF(kvGet, LuaKvGetRequest) {
           KJ_IF_SOME(host, hostOperations) {
-            KJ_IF_SOME(response, co_await host->kvGet(kvGet.bindingIndex, kj::mv(kvGet.key))) {
-              auto value = co_await readLuaKvResponseBody(kj::mv(response.body));
-              const char* bytes =
-                  value.size() == 0 ? "" : reinterpret_cast<const char*>(value.begin());
-              lua_pushlstring(coroutine, bytes, value.size());
+            auto response = co_await host->kvGet(
+                kvGet.bindingIndex, kj::mv(kvGet.key), kj::mv(kvGet.options), kvGet.mode);
+            kj::Maybe<kj::Array<kj::byte>> value;
+            KJ_IF_SOME(body, response.body) {
+              value = co_await readLuaKvResponseBody(kj::mv(body));
+            }
+            if (kvGet.mode == LuaKvGetMode::WITH_METADATA) {
+              lua_createtable(coroutine, 0, 3);
+              int resultIndex = absoluteIndex(coroutine, -1);
+              lua_pushstring(coroutine, "value");
+              KJ_IF_SOME(bytes, value) {
+                const char* data =
+                    bytes.size() == 0 ? "" : reinterpret_cast<const char*>(bytes.begin());
+                lua_pushlstring(coroutine, data, bytes.size());
+              } else {
+                pushWorkerdNull(coroutine);
+              }
+              lua_rawset(coroutine, resultIndex);
+              lua_pushstring(coroutine, "metadata");
+              KJ_IF_SOME(metadata, response.metadata) {
+                pushJsonText(coroutine, metadata);
+              } else {
+                pushWorkerdNull(coroutine);
+              }
+              lua_rawset(coroutine, resultIndex);
+              lua_pushstring(coroutine, "cacheStatus");
+              KJ_IF_SOME(cacheStatus, response.cacheStatus) {
+                lua_pushlstring(coroutine, cacheStatus.begin(), cacheStatus.size());
+              } else {
+                pushWorkerdNull(coroutine);
+              }
+              lua_rawset(coroutine, resultIndex);
             } else {
-              lua_pushnil(coroutine);
+              KJ_IF_SOME(bytes, value) {
+                const char* data =
+                    bytes.size() == 0 ? "" : reinterpret_cast<const char*>(bytes.begin());
+                lua_pushlstring(coroutine, data, bytes.size());
+              } else {
+                lua_pushnil(coroutine);
+              }
             }
           } else {
             KJ_FAIL_REQUIRE("workerd.bindings KV get() is unavailable in this context");
@@ -1507,7 +1664,8 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
         }
         KJ_CASE_ONEOF(kvPut, LuaKvPutRequest) {
           KJ_IF_SOME(host, hostOperations) {
-            co_await host->kvPut(kvPut.bindingIndex, kj::mv(kvPut.key), kj::mv(kvPut.value));
+            co_await host->kvPut(
+                kvPut.bindingIndex, kj::mv(kvPut.key), kj::mv(kvPut.value), kj::mv(kvPut.options));
             lua_pushnil(coroutine);
           } else {
             KJ_FAIL_REQUIRE("workerd.bindings KV put() is unavailable in this context");
@@ -1732,38 +1890,75 @@ kj::Own<kj::HttpClient> LuaIoContext::getKvHttpClient(size_t bindingIndex,
   return asHttpClient(kj::mv(subrequest));
 }
 
-kj::Promise<kj::Maybe<LuaKvResponse>> LuaIoContext::kvGet(size_t bindingIndex, kj::String key) {
+kj::Promise<LuaKvGetResponse> LuaIoContext::kvGet(
+    size_t bindingIndex, kj::String key, LuaKvGetOptions options, LuaKvGetMode mode) {
+  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
+                     .newChild(kj::ConstString(kj::str(
+                         mode == LuaKvGetMode::VALUE ? "lua.kv.get" : "lua.kv.get_with_metadata")));
+  tracing.setTag("cloudflare.kv.query.keys"_kjc, key.asPtr());
+  tracing.setTag("cloudflare.kv.query.keys.count"_kjc, static_cast<int64_t>(1));
+
   kj::Url url;
   url.scheme = kj::str("https");
   url.host = kj::str("fake-host");
   url.path.add(kj::mv(key));
   url.query.add(kj::Url::QueryParam{kj::str("urlencoded"), kj::str("true")});
+  KJ_IF_SOME(cacheTtl, options.cacheTtl) {
+    url.query.add(kj::Url::QueryParam{kj::str("cache_ttl"), kj::str(cacheTtl)});
+    tracing.setTag("cloudflare.kv.query.cache_ttl"_kjc, static_cast<int64_t>(cacheTtl));
+  }
   auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
   kj::HttpHeaders headers(headerTable);
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str("lua.kv.get")));
-  auto client = getKvHttpClient(bindingIndex, KvOperationType::GET, urlText, headers, tracing);
+  auto operation = mode == LuaKvGetMode::VALUE ? KvOperationType::GET : KvOperationType::GET_WITH;
+  auto client = getKvHttpClient(bindingIndex, operation, urlText, headers, tracing);
   auto request = attachToRequest(client->request(kj::HttpMethod::GET, urlText, headers),
       kj::Rc<kj::HttpClient>(kj::mv(client)));
   auto response = co_await kj::mv(request.response);
-  if (response.statusCode == 404 || response.statusCode == 410) co_return kj::none;
+  kj::Maybe<kj::String> cacheStatus;
+  KJ_IF_SOME(headerId, headerTable.stringToId("cf-cache-status")) {
+    cacheStatus =
+        response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
+  }
+  if (response.statusCode == 404 || response.statusCode == 410) {
+    co_return LuaKvGetResponse{.body = kj::none, .cacheStatus = kj::mv(cacheStatus)};
+  }
   KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
       "Lua KV GET failed:", response.statusCode, response.statusText);
-  co_return LuaKvResponse{.body = kj::mv(response.body)};
+  kj::Maybe<kj::String> metadata;
+  KJ_IF_SOME(headerId, headerTable.stringToId("cf-kv-metadata")) {
+    metadata =
+        response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
+  }
+  co_return LuaKvGetResponse{
+    .body = kj::mv(response.body),
+    .metadata = kj::mv(metadata),
+    .cacheStatus = kj::mv(cacheStatus),
+  };
 }
 
 kj::Promise<void> LuaIoContext::kvPut(
-    size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) {
+    size_t bindingIndex, kj::String key, kj::Array<kj::byte> value, LuaKvPutOptions options) {
+  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
+                     .newChild(kj::ConstString(kj::str("lua.kv.put")));
+  tracing.setTag("cloudflare.kv.query.keys"_kjc, key.asPtr());
+  tracing.setTag("cloudflare.kv.query.keys.count"_kjc, static_cast<int64_t>(1));
+
   kj::Url url;
   url.scheme = kj::str("https");
   url.host = kj::str("fake-host");
   url.path.add(kj::mv(key));
   url.query.add(kj::Url::QueryParam{kj::str("urlencoded"), kj::str("true")});
+  KJ_IF_SOME(expiration, options.expiration) {
+    url.query.add(kj::Url::QueryParam{kj::str("expiration"), kj::str(expiration)});
+    tracing.setTag("cloudflare.kv.query.expiration"_kjc, static_cast<int64_t>(expiration));
+  }
+  KJ_IF_SOME(expirationTtl, options.expirationTtl) {
+    url.query.add(kj::Url::QueryParam{kj::str("expiration_ttl"), kj::str(expirationTtl)});
+    tracing.setTag("cloudflare.kv.query.expiration_ttl"_kjc, static_cast<int64_t>(expirationTtl));
+  }
   auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
   kj::HttpHeaders headers(headerTable);
   headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/octet-stream"_kj);
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str("lua.kv.put")));
   auto client = getKvHttpClient(bindingIndex, KvOperationType::PUT, urlText, headers, tracing);
   auto request = attachToRequest(
       client->request(kj::HttpMethod::PUT, urlText, headers, static_cast<uint64_t>(value.size())),
@@ -1797,7 +1992,7 @@ kj::Promise<void> LuaIoContext::kvDelete(size_t bindingIndex, kj::String key) {
   co_await response.body->readAllBytes(64 * 1024).attach(kj::mv(response.body));
 }
 
-kj::Promise<LuaKvResponse> LuaIoContext::kvList(size_t bindingIndex, LuaKvListOptions options) {
+kj::Promise<LuaKvListResponse> LuaIoContext::kvList(size_t bindingIndex, LuaKvListOptions options) {
   kj::Url url;
   url.scheme = kj::str("https");
   url.host = kj::str("fake-host");
@@ -1827,7 +2022,7 @@ kj::Promise<LuaKvResponse> LuaIoContext::kvList(size_t bindingIndex, LuaKvListOp
     cacheStatus =
         response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
   }
-  co_return LuaKvResponse{.body = kj::mv(response.body), .cacheStatus = kj::mv(cacheStatus)};
+  co_return LuaKvListResponse{.body = kj::mv(response.body), .cacheStatus = kj::mv(cacheStatus)};
 }
 
 kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {

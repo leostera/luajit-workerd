@@ -970,7 +970,7 @@ KJ_TEST("Server: LuaJIT KV bindings preserve configured routing and basic operat
     services = [
       ( name = "lua",
         worker = (
-          luaScript = "return { fetch = function() local missing = workerd.bindings.KV.get('absent'); local value = workerd.bindings.KV.get('lookup'); workerd.bindings.KV.put('stored', 'put-value'); workerd.bindings.KV.delete('removed'); return { status = 200, body = (missing == nil and 'missing' or missing) .. ':' .. (value or 'missing') } end }",
+          luaScript = "return { fetch = function() local missing = workerd.bindings.KV.get('absent'); local value = workerd.bindings.KV.get('lookup'); workerd.bindings.KV.put('stored', 'put-value', {expirationTtl=120}); workerd.bindings.KV.put('stored-exp', 'expiration-value', {expiration=2000000000}); workerd.bindings.KV.delete('removed'); return { status = 200, body = (missing == nil and 'missing' or missing) .. ':' .. (value or 'missing') } end }",
 
           globalOutbound = "custom",
           bindings = [(name = "KV", kvNamespace = "kv-outbound")]
@@ -1004,13 +1004,79 @@ KJ_TEST("Server: LuaJIT KV bindings preserve configured routing and basic operat
   )"_blockquote);
   getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 5\n\nvalue"_kj);
   getSubrequest.recvRegex(
-      R"(PUT /stored\?urlencoded=true HTTP/1\.1[\s\S]*CF-KV-FLPROD-405: https://fake-host/stored\?urlencoded=true[\s\S]*put-value[\s\S]*)");
+      R"(PUT /stored\?urlencoded=true&expiration_ttl=120 HTTP/1\.1[\s\S]*CF-KV-FLPROD-405: https://fake-host/stored\?urlencoded=true&expiration_ttl=120[\s\S]*put-value[\s\S]*)");
+  getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 0\n\n"_kj);
+  getSubrequest.recvRegex(
+      R"(PUT /stored-exp\?urlencoded=true&expiration=2000000000 HTTP/1\.1[\s\S]*CF-KV-FLPROD-405: https://fake-host/stored-exp\?urlencoded=true&expiration=2000000000[\s\S]*expiration-value[\s\S]*)");
   getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 0\n\n"_kj);
   getSubrequest.recvRegex(
       R"(DELETE /removed\?urlencoded=true HTTP/1\.1[\s\S]*CF-KV-FLPROD-405: https://fake-host/removed\?urlencoded=true[\s\S]*)");
   getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 0\n\n"_kj);
 
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*missing:value)");
+}
+
+KJ_TEST("Server: LuaJIT KV getWithMetadata preserves configured routing and response metadata") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local result = workerd.bindings.KV.getWithMetadata('meta', {cacheTtl=120}); return {status=200, body=tostring(result.value == 'binary') .. ':' .. tostring(result.metadata.level) .. ':' .. result.cacheStatus} end }",
+          bindings = [(name = "KV", kvNamespace = "kv-outbound")]
+        )
+      ),
+      ( name = "kv-outbound", external = "kv-host" )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/get");
+  auto subrequest = test.receiveSubrequest("kv-host");
+  subrequest.recv(R"(
+    GET /meta?urlencoded=true&cache_ttl=120 HTTP/1.1
+    Host: fake-host
+    CF-KV-FLPROD-405: https://fake-host/meta?urlencoded=true&cache_ttl=120
+
+  )"_blockquote);
+  subrequest.send(
+      "HTTP/1.1 200 OK\nContent-Length: 6\nCF-KV-Metadata: {\"level\":1}\nCF-Cache-Status: HIT\n\nbinary"_kj);
+
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*true:1:HIT)");
+}
+
+KJ_TEST("Server: LuaJIT KV getWithMetadata maps missing values and cache status") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local result = workerd.bindings.KV.getWithMetadata('missing'); return {status=200, body=tostring(result.value == workerd.null) .. ':' .. tostring(result.metadata == workerd.null) .. ':' .. result.cacheStatus} end }",
+          bindings = [(name = "KV", kvNamespace = "kv-outbound")]
+        )
+      ),
+      ( name = "kv-outbound", external = "kv-host" )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/get");
+  auto subrequest = test.receiveSubrequest("kv-host");
+  subrequest.recv(R"(
+    GET /missing?urlencoded=true HTTP/1.1
+    Host: fake-host
+    CF-KV-FLPROD-405: https://fake-host/missing?urlencoded=true
+
+  )"_blockquote);
+  subrequest.send("HTTP/1.1 404 Not Found\nContent-Length: 1\nCF-Cache-Status: MISS\n\nx"_kj);
+
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*true:true:MISS)");
 }
 
 KJ_TEST("Server: LuaJIT KV list preserves configured routing and result fields") {

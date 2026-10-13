@@ -95,9 +95,29 @@ struct LuaHttpResponse {
   kj::Own<kj::AsyncInputStream> body;
 };
 
-struct LuaKvResponse {
+enum class LuaKvGetMode {
+  VALUE,
+  WITH_METADATA,
+};
+
+struct LuaKvGetOptions {
+  kj::Maybe<uint32_t> cacheTtl;
+};
+
+struct LuaKvGetResponse {
+  kj::Maybe<kj::Own<kj::AsyncInputStream>> body;
+  kj::Maybe<kj::String> metadata;
+  kj::Maybe<kj::String> cacheStatus;
+};
+
+struct LuaKvListResponse {
   kj::Own<kj::AsyncInputStream> body;
   kj::Maybe<kj::String> cacheStatus = kj::none;
+};
+
+struct LuaKvPutOptions {
+  kj::Maybe<uint32_t> expiration;
+  kj::Maybe<uint32_t> expirationTtl;
 };
 
 struct LuaKvListOptions {
@@ -136,11 +156,12 @@ class LuaHostOperations: public kj::PtrTarget {
   virtual bool hasRequestBodyStream() const = 0;
   // Read up to maxBytes from the current inbound request body; return none at EOF.
   virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) = 0;
-  virtual kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) = 0;
+  virtual kj::Promise<LuaKvGetResponse> kvGet(
+      size_t bindingIndex, kj::String key, LuaKvGetOptions options, LuaKvGetMode mode) = 0;
   virtual kj::Promise<void> kvPut(
-      size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) = 0;
+      size_t bindingIndex, kj::String key, kj::Array<kj::byte> value, LuaKvPutOptions options) = 0;
   virtual kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) = 0;
-  virtual kj::Promise<LuaKvResponse> kvList(size_t bindingIndex, LuaKvListOptions options) = 0;
+  virtual kj::Promise<LuaKvListResponse> kvList(size_t bindingIndex, LuaKvListOptions options) = 0;
 };
 
 class LuaRuntime final {
