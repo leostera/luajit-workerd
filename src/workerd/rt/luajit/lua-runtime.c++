@@ -21,6 +21,7 @@
 
 #include <climits>
 #include <cstring>
+#include <new>
 
 namespace workerd::rt::luajit {
 namespace {
@@ -301,34 +302,109 @@ bool computeHmac(const EVP_MD* algorithm,
   return result != nullptr && outputLength == static_cast<unsigned int>(expectedOutputLength);
 }
 
+constexpr char LUA_HMAC_KEY_METATABLE[] = "workerd.HmacCryptoKey";
+
+struct LuaHmacKeyUserdata {
+  kj::Own<LuaHmacKey> key;
+};
+
+int destroyLuaHmacKey(lua_State* state) {
+  auto* userdata = static_cast<LuaHmacKeyUserdata*>(lua_touserdata(state, 1));
+  if (userdata != nullptr) userdata->~LuaHmacKeyUserdata();
+  return 0;
+}
+
+int stringifyLuaHmacKey(lua_State* state) {
+  lua_pushliteral(state, "[CryptoKey]");
+  return 1;
+}
+
+void installLuaHmacKeyMetatable(lua_State* state) {
+  if (luaL_newmetatable(state, LUA_HMAC_KEY_METATABLE) != 0) {
+    lua_pushcfunction(state, destroyLuaHmacKey);
+    lua_setfield(state, -2, "__gc");
+    lua_pushcfunction(state, stringifyLuaHmacKey);
+    lua_setfield(state, -2, "__tostring");
+    lua_pushboolean(state, 0);
+    lua_setfield(state, -2, "__metatable");
+  }
+  lua_pop(state, 1);
+}
+
+void pushLuaHmacKey(lua_State* state, kj::Own<LuaHmacKey> key) {
+  KJ_REQUIRE(key.get() != nullptr, "LuaJIT HMAC key binding has no key data");
+  new (lua_newuserdata(state, sizeof(LuaHmacKeyUserdata))) LuaHmacKeyUserdata{kj::mv(key)};
+  luaL_getmetatable(state, LUA_HMAC_KEY_METATABLE);
+  KJ_REQUIRE(lua_istable(state, -1), "LuaJIT HMAC key metatable is unavailable");
+  lua_setmetatable(state, -2);
+}
+
+LuaHmacKeyUserdata* checkLuaHmacKey(lua_State* state, int index) {
+  return static_cast<LuaHmacKeyUserdata*>(luaL_checkudata(state, index, LUA_HMAC_KEY_METATABLE));
+}
+
+bool hasLuaHmacKeyUsage(const LuaHmacKey& key, LuaHmacKeyUsage usage) {
+  for (auto candidate: key.getUsages()) {
+    if (candidate == usage) return true;
+  }
+  return false;
+}
+
+bool isSupportedBoundHmacAlgorithm(const EVP_MD* algorithm) {
+  return algorithm == EVP_sha1() || algorithm == EVP_sha256() || algorithm == EVP_sha384() ||
+      algorithm == EVP_sha512();
+}
+
 int hmac(lua_State* state) {
-  if (lua_gettop(state) != 3 || lua_type(state, 1) != LUA_TSTRING ||
-      lua_type(state, 2) != LUA_TSTRING || lua_type(state, 3) != LUA_TSTRING) {
-    return luaL_error(state, "workerd.hmac() expects an algorithm, raw key, and binary string");
-  }
-
-  size_t algorithmLength = 0;
-  const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
-  const EVP_MD* digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
-  if (digestAlgorithm == nullptr) {
-    return luaL_error(state, "workerd.hmac() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
-  }
-
+  const EVP_MD* digestAlgorithm = nullptr;
+  const char* keyBytes = nullptr;
   size_t keyLength = 0;
-  const char* key = lua_tolstring(state, 2, &keyLength);
+  const char* input = nullptr;
+  size_t inputLength = 0;
+
+  if (lua_gettop(state) == 2 && lua_type(state, 1) == LUA_TUSERDATA) {
+    auto* userdata = checkLuaHmacKey(state, 1);
+    if (!hasLuaHmacKeyUsage(*userdata->key, LuaHmacKeyUsage::SIGN)) {
+      return luaL_error(state, "workerd.hmac() CryptoKey does not allow sign usage");
+    }
+    auto algorithmName = userdata->key->getHashAlgorithm();
+    digestAlgorithm = findLuaDigestAlgorithm(algorithmName.begin(), algorithmName.size());
+    if (!isSupportedBoundHmacAlgorithm(digestAlgorithm)) {
+      return luaL_error(state, "workerd.hmac() CryptoKey has an unsupported HMAC hash");
+    }
+    auto keyData = userdata->key->getKeyData();
+    keyBytes = reinterpret_cast<const char*>(keyData.begin());
+    keyLength = keyData.size();
+    if (lua_type(state, 2) != LUA_TSTRING) {
+      return luaL_error(state, "workerd.hmac() input must be a binary string");
+    }
+    input = lua_tolstring(state, 2, &inputLength);
+  } else if (lua_gettop(state) == 3 && lua_type(state, 1) == LUA_TSTRING &&
+      lua_type(state, 2) == LUA_TSTRING && lua_type(state, 3) == LUA_TSTRING) {
+    size_t algorithmLength = 0;
+    const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
+    digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
+    if (digestAlgorithm == nullptr) {
+      return luaL_error(state, "workerd.hmac() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
+    }
+    keyBytes = lua_tolstring(state, 2, &keyLength);
+    input = lua_tolstring(state, 3, &inputLength);
+  } else {
+    return luaL_error(
+        state, "workerd.hmac() expects (algorithm, rawKey, input) or (cryptoKey, input)");
+  }
+
   if (keyLength == 0 || keyLength > LuaRuntime::MAX_HMAC_KEY_BYTES) {
     return luaL_error(state, "workerd.hmac() key must be from 1 through 65536 bytes");
   }
-
-  size_t inputLength = 0;
-  const char* input = lua_tolstring(state, 3, &inputLength);
   if (inputLength > LuaRuntime::MAX_CRYPTO_INPUT_BYTES) {
     return luaL_error(state, "workerd.hmac() input exceeds the 1048576-byte limit");
   }
 
   unsigned char output[64];
   unsigned int outputLength = 0;
-  if (!computeHmac(digestAlgorithm, key, keyLength, input, inputLength, output, outputLength)) {
+  if (!computeHmac(
+          digestAlgorithm, keyBytes, keyLength, input, inputLength, output, outputLength)) {
     return luaL_error(state, "workerd.hmac() failed");
   }
   lua_pushlstring(state, reinterpret_cast<const char*>(output), outputLength);
@@ -336,38 +412,61 @@ int hmac(lua_State* state) {
 }
 
 int verifyHmac(lua_State* state) {
-  if (lua_gettop(state) != 4 || lua_type(state, 1) != LUA_TSTRING ||
-      lua_type(state, 2) != LUA_TSTRING || lua_type(state, 3) != LUA_TSTRING ||
-      lua_type(state, 4) != LUA_TSTRING) {
-    return luaL_error(
-        state, "workerd.verifyHmac() expects an algorithm, raw key, binary string, and MAC");
-  }
-
-  size_t algorithmLength = 0;
-  const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
-  const EVP_MD* digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
-  if (digestAlgorithm == nullptr) {
-    return luaL_error(
-        state, "workerd.verifyHmac() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
-  }
-
+  const EVP_MD* digestAlgorithm = nullptr;
+  const char* keyBytes = nullptr;
   size_t keyLength = 0;
-  const char* key = lua_tolstring(state, 2, &keyLength);
+  const char* input = nullptr;
+  size_t inputLength = 0;
+  const char* mac = nullptr;
+  size_t macLength = 0;
+
+  if (lua_gettop(state) == 3 && lua_type(state, 1) == LUA_TUSERDATA) {
+    auto* userdata = checkLuaHmacKey(state, 1);
+    if (!hasLuaHmacKeyUsage(*userdata->key, LuaHmacKeyUsage::VERIFY)) {
+      return luaL_error(state, "workerd.verifyHmac() CryptoKey does not allow verify usage");
+    }
+    auto algorithmName = userdata->key->getHashAlgorithm();
+    digestAlgorithm = findLuaDigestAlgorithm(algorithmName.begin(), algorithmName.size());
+    if (!isSupportedBoundHmacAlgorithm(digestAlgorithm)) {
+      return luaL_error(state, "workerd.verifyHmac() CryptoKey has an unsupported HMAC hash");
+    }
+    auto keyData = userdata->key->getKeyData();
+    keyBytes = reinterpret_cast<const char*>(keyData.begin());
+    keyLength = keyData.size();
+    if (lua_type(state, 2) != LUA_TSTRING || lua_type(state, 3) != LUA_TSTRING) {
+      return luaL_error(state, "workerd.verifyHmac() input and MAC must be binary strings");
+    }
+    input = lua_tolstring(state, 2, &inputLength);
+    mac = lua_tolstring(state, 3, &macLength);
+  } else if (lua_gettop(state) == 4 && lua_type(state, 1) == LUA_TSTRING &&
+      lua_type(state, 2) == LUA_TSTRING && lua_type(state, 3) == LUA_TSTRING &&
+      lua_type(state, 4) == LUA_TSTRING) {
+    size_t algorithmLength = 0;
+    const char* algorithm = lua_tolstring(state, 1, &algorithmLength);
+    digestAlgorithm = findLuaDigestAlgorithm(algorithm, algorithmLength);
+    if (digestAlgorithm == nullptr) {
+      return luaL_error(
+          state, "workerd.verifyHmac() supports MD5, SHA-1, SHA-256, SHA-384, and SHA-512");
+    }
+    keyBytes = lua_tolstring(state, 2, &keyLength);
+    input = lua_tolstring(state, 3, &inputLength);
+    mac = lua_tolstring(state, 4, &macLength);
+  } else {
+    return luaL_error(state,
+        "workerd.verifyHmac() expects (algorithm, rawKey, input, mac) or (cryptoKey, input, mac)");
+  }
+
   if (keyLength == 0 || keyLength > LuaRuntime::MAX_HMAC_KEY_BYTES) {
     return luaL_error(state, "workerd.verifyHmac() key must be from 1 through 65536 bytes");
   }
-
-  size_t inputLength = 0;
-  const char* input = lua_tolstring(state, 3, &inputLength);
   if (inputLength > LuaRuntime::MAX_CRYPTO_INPUT_BYTES) {
     return luaL_error(state, "workerd.verifyHmac() input exceeds the 1048576-byte limit");
   }
 
-  size_t macLength = 0;
-  const char* mac = lua_tolstring(state, 4, &macLength);
   unsigned char output[64];
   unsigned int outputLength = 0;
-  if (!computeHmac(digestAlgorithm, key, keyLength, input, inputLength, output, outputLength)) {
+  if (!computeHmac(
+          digestAlgorithm, keyBytes, keyLength, input, inputLength, output, outputLength)) {
     return luaL_error(state, "workerd.verifyHmac() failed");
   }
   bool valid = macLength == outputLength && CRYPTO_memcmp(output, mac, outputLength) == 0;
@@ -535,8 +634,9 @@ void installRequestCfJson(lua_State* state, int tableIndex, kj::StringPtr json) 
   lua_setmetatable(state, tableIndex);
 }
 
-void pushLuaBindings(lua_State* state, kj::ArrayPtr<const LuaBinding> bindings) {
+void pushLuaBindings(lua_State* state, kj::ArrayPtr<LuaBinding> bindings) {
   KJ_REQUIRE(bindings.size() <= INT_MAX, "too many Lua bindings");
+  installLuaHmacKeyMetatable(state);
   lua_getglobal(state, "workerd");
   KJ_REQUIRE(lua_istable(state, -1), "LuaJIT workerd API table is unavailable");
   lua_createtable(state, 0, static_cast<int>(bindings.size()));
@@ -562,6 +662,15 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<const LuaBinding> bindings) 
         })) {
           KJ_FAIL_REQUIRE("LuaJIT JSON binding", binding.name, "is invalid:", exception);
         }
+        break;
+      }
+      case LuaBinding::Type::HMAC_KEY: {
+        KJ_REQUIRE(binding.hmacKey.get() != nullptr, "LuaJIT HMAC key binding has no key data");
+        auto algorithmName = binding.hmacKey->getHashAlgorithm();
+        auto* algorithm = findLuaDigestAlgorithm(algorithmName.begin(), algorithmName.size());
+        KJ_REQUIRE(isSupportedBoundHmacAlgorithm(algorithm),
+            "LuaJIT CryptoKey binding only supports HMAC with SHA-1/SHA-2");
+        pushLuaHmacKey(state, kj::mv(binding.hmacKey));
         break;
       }
       case LuaBinding::Type::NULL_VALUE:
@@ -936,6 +1045,31 @@ void pushHttpResponse(lua_State* state,
 }
 
 }  // namespace
+
+LuaHmacKey::LuaHmacKey(
+    kj::String hashAlgorithm, kj::Array<kj::byte> keyData, kj::Array<LuaHmacKeyUsage> usages)
+    : hashAlgorithm(kj::mv(hashAlgorithm)),
+      keyData(kj::mv(keyData)),
+      usages(kj::mv(usages)) {
+  KJ_REQUIRE(this->keyData.size() > 0 && this->keyData.size() <= LuaRuntime::MAX_HMAC_KEY_BYTES,
+      "LuaJIT CryptoKey key data must be from 1 through 65536 bytes");
+}
+
+LuaHmacKey::~LuaHmacKey() noexcept {
+  if (keyData.size() > 0) OPENSSL_cleanse(keyData.begin(), keyData.size());
+}
+
+kj::StringPtr LuaHmacKey::getHashAlgorithm() const {
+  return hashAlgorithm;
+}
+
+kj::ArrayPtr<const kj::byte> LuaHmacKey::getKeyData() const {
+  return keyData.asPtr();
+}
+
+kj::ArrayPtr<const LuaHmacKeyUsage> LuaHmacKey::getUsages() const {
+  return usages.asPtr();
+}
 
 LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<LuaBinding> bindings)
     : timer(timer),

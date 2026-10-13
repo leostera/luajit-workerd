@@ -107,7 +107,7 @@ Trace construction, route selection, pending-work cancellation, and resource lif
 
 ## Configuration and capability ownership
 
-- Parse text, data, JSON, and `fromEnvironment` bindings into typed descriptors during config setup; reject duplicates and unsupported types before serving. Treat HTTP service bindings as request-scoped capabilities over linked channels; storage, actors, and cryptographic keys need additional type-specific contracts.
+- Parse text, data, JSON, restricted HMAC CryptoKey, and `fromEnvironment` bindings into typed descriptors during config setup; reject duplicates and unsupported types before serving. HMAC keys accept only non-extractable raw/hex/base64 data, SHA-1/SHA-2 hashes, and `sign`/`verify` usages; Lua receives opaque key userdata used by the HMAC operations, and the server-owned byte buffer is cleansed on destruction. Treat HTTP service bindings as request-scoped capabilities over linked channels; storage and actors still need additional type-specific contracts.
 - Resolve/link `globalOutbound` and HTTP service-binding targets once at the service layer; create per-request call handles with fresh metadata at dispatch.
 - No Lua global should hold a request-scoped service handle. Any handle returned to Lua must either be request-bound and invalidated at completion, or be a safe config-level immutable descriptor that can only create a current-request operation.
 - Keep worker code/config and runtime state service-scoped; keep body streams, network clients, timers, trace parents, and cancellation request-scoped.

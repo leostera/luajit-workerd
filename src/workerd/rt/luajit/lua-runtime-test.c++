@@ -1345,6 +1345,90 @@ KJ_TEST("LuaJIT computes bounded binary-safe HMAC values") {
       "20b3a393e9f0e606ae91954f1f871ebd5cd9c3a8f26e7b22beaed26ab4891891:true:true:true:true:true:true:true:true:true");
 }
 
+KJ_TEST("LuaJIT HMAC CryptoKey bindings are opaque and enforce usages") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    local function toHex(value)
+      return (value:gsub(".", function(byte)
+        return string.format("%02x", byte:byte())
+      end))
+    end
+    return {
+      fetch = function()
+        local key = workerd.bindings.SIGNING_KEY
+        local verifyOnly = workerd.bindings.VERIFY_ONLY
+        local signOnly = workerd.bindings.SIGN_ONLY
+        local message = "The quick brown fox jumps over the lazy dog"
+        local mac = workerd.hmac(key, message)
+        local verifies = workerd.verifyHmac(key, message, mac)
+        local rejectsChangedMessage = not workerd.verifyHmac(key, message .. "!", mac)
+        local rejectsWrongUsage = not pcall(workerd.hmac, verifyOnly, message) and
+          not pcall(workerd.verifyHmac, signOnly, message, mac)
+        local supportedHashes =
+          workerd.hmac(workerd.bindings.SHA1_KEY, message) == workerd.hmac("SHA-1", "key", message) and
+          workerd.hmac(key, message) == workerd.hmac("SHA-256", "key", message) and
+          workerd.hmac(workerd.bindings.SHA384_KEY, message) == workerd.hmac("SHA-384", "key", message) and
+          workerd.hmac(workerd.bindings.SHA512_KEY, message) == workerd.hmac("SHA-512", "key", message)
+        return {
+          status = 200,
+          body = toHex(mac) .. ":" .. tostring(verifies) .. ":" ..
+            tostring(rejectsChangedMessage) .. ":" .. tostring(rejectsWrongUsage) .. ":" ..
+            tostring(tostring(key) == "[CryptoKey]") .. ":" .. tostring(getmetatable(key) == false) .. ":" ..
+            tostring(supportedHashes),
+        }
+      end,
+    }
+  )lua"_kj;
+
+  auto makeKey = [](kj::StringPtr hashAlgorithm, kj::Array<LuaHmacKeyUsage> usages) {
+    auto keyData = kj::heapArray<kj::byte>(3);
+    std::memcpy(keyData.begin(), "key", 3);
+    return kj::heap<LuaHmacKey>(kj::str(hashAlgorithm), kj::mv(keyData), kj::mv(usages));
+  };
+  kj::Vector<LuaBinding> bindings;
+  kj::Vector<LuaHmacKeyUsage> signingAndVerifying;
+  signingAndVerifying.add(LuaHmacKeyUsage::SIGN);
+  signingAndVerifying.add(LuaHmacKeyUsage::VERIFY);
+  bindings.add(LuaBinding{
+    .name = kj::str("SIGNING_KEY"),
+    .type = LuaBinding::Type::HMAC_KEY,
+    .hmacKey = makeKey("SHA-256"_kj, signingAndVerifying.releaseAsArray()),
+  });
+  kj::Vector<LuaHmacKeyUsage> verifyOnly;
+  verifyOnly.add(LuaHmacKeyUsage::VERIFY);
+  bindings.add(LuaBinding{
+    .name = kj::str("VERIFY_ONLY"),
+    .type = LuaBinding::Type::HMAC_KEY,
+    .hmacKey = makeKey("SHA-256"_kj, verifyOnly.releaseAsArray()),
+  });
+  kj::Vector<LuaHmacKeyUsage> signOnly;
+  signOnly.add(LuaHmacKeyUsage::SIGN);
+  bindings.add(LuaBinding{
+    .name = kj::str("SIGN_ONLY"),
+    .type = LuaBinding::Type::HMAC_KEY,
+    .hmacKey = makeKey("SHA-256"_kj, signOnly.releaseAsArray()),
+  });
+  auto addSigningKey = [&](kj::StringPtr name, kj::StringPtr hashAlgorithm) {
+    kj::Vector<LuaHmacKeyUsage> usages;
+    usages.add(LuaHmacKeyUsage::SIGN);
+    bindings.add(LuaBinding{
+      .name = kj::str(name),
+      .type = LuaBinding::Type::HMAC_KEY,
+      .hmacKey = makeKey(hashAlgorithm, usages.releaseAsArray()),
+    });
+  };
+  addSigningKey("SHA1_KEY"_kj, "SHA-1"_kj);
+  addSigningKey("SHA384_KEY"_kj, "SHA-384"_kj);
+  addSigningKey("SHA512_KEY"_kj, "SHA-512"_kj);
+
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/crypto-key"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) ==
+      "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8:true:true:true:true:true:true");
+}
+
 KJ_TEST("LuaJIT service binding fetches select their configured channel") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(

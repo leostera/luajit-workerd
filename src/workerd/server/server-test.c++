@@ -1236,6 +1236,115 @@ KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*hello:true:true)");
 }
 
+KJ_TEST("Server: LuaJIT exposes bounded HMAC CryptoKey bindings") {
+  TestServer test(singleWorker(R"((
+    luaScript = "local function hex(value) return (value:gsub('.', function(byte) return string.format('%02x', byte:byte()) end)) end; return { fetch = function() local b = workerd.bindings; local rawMac = workerd.hmac(b.RAW_KEY, 'The quick brown fox jumps over the lazy dog'); local hexMac = workerd.hmac(b.HEX_KEY, 'The quick brown fox jumps over the lazy dog'); local base64Mac = workerd.hmac(b.BASE64_KEY, 'The quick brown fox jumps over the lazy dog'); local objectHashMac = workerd.hmac(b.OBJECT_HASH_KEY, 'The quick brown fox jumps over the lazy dog'); return { status = 200, body = hex(rawMac) .. ':' .. tostring(hexMac == rawMac) .. ':' .. tostring(base64Mac == rawMac) .. ':' .. tostring(objectHashMac == rawMac) .. ':' .. tostring(workerd.verifyHmac(b.RAW_KEY, 'The quick brown fox jumps over the lazy dog', rawMac)) } end }",
+    bindings = [
+      (name = "RAW_KEY", cryptoKey = (
+        raw = "key",
+        algorithm = (json = `{"name":"HMAC","hash":"SHA-256"}
+        ),
+        extractable = false,
+        usages = [sign, verify]
+      )),
+      (name = "HEX_KEY", cryptoKey = (
+        hex = "6b6579",
+        algorithm = (json = `{"name":"HMAC","hash":"SHA-256"}
+        ),
+        usages = [sign]
+      )),
+      (name = "BASE64_KEY", cryptoKey = (
+        base64 = "a2V5",
+        algorithm = (json = `{"name":"HMAC","hash":"SHA-256"}
+        ),
+        usages = [sign]
+      )),
+      (name = "OBJECT_HASH_KEY", cryptoKey = (
+        raw = "key",
+        algorithm = (json = `{"name":"hmac","hash":{"name":"sha-256"}}
+        ),
+        usages = [sign]
+      ))
+    ]
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recvRegex(
+      R"(HTTP/1\.1 200 LuaJIT[\s\S]*f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8:true:true:true:true)");
+}
+
+KJ_TEST("Server: LuaJIT rejects unsupported CryptoKey configuration") {
+  {
+    TestServer test(singleWorker(R"((
+      luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+      bindings = [(name = "KEY", cryptoKey = (
+        raw = "key",
+        algorithm = (json = `{"name":"HMAC","hash":"SHA-256"}
+        ),
+        extractable = true,
+        usages = [sign]
+      ))]
+    ))"_kj));
+
+    test.server.allowExperimental();
+    test.expectErrors(R"(
+      service hello: LuaJIT worker "hello" CryptoKey binding "KEY" is unsupported: expected !config.getExtractable(); LuaJIT only supports non-extractable CryptoKey bindings
+    )"_blockquote);
+  }
+  {
+    TestServer test(singleWorker(R"((
+      luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+      bindings = [(name = "KEY", cryptoKey = (
+        hex = "not-hex",
+        algorithm = (json = `{"name":"HMAC","hash":"SHA-256"}
+        ),
+        usages = [sign]
+      ))]
+    ))"_kj));
+
+    test.server.allowExperimental();
+    test.expectErrors(R"(
+      service hello: LuaJIT worker "hello" CryptoKey binding "KEY" is unsupported: expected !hadErrors; LuaJIT CryptoKey binding contains invalid hex
+    )"_blockquote);
+  }
+  {
+    TestServer test(singleWorker(R"((
+      luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+      bindings = [(name = "KEY", cryptoKey = (
+        raw = "key",
+        algorithm = (json = `{"name":"HMAC"}
+        ),
+        usages = [sign]
+      ))]
+    ))"_kj));
+
+    test.server.allowExperimental();
+    test.expectErrors(R"(
+      service hello: LuaJIT worker "hello" CryptoKey binding "KEY" is unsupported: expected kj::mv(hashName) != nullptr; LuaJIT HMAC CryptoKey algorithm is missing its hash
+    )"_blockquote);
+  }
+  {
+    TestServer test(singleWorker(R"((
+      luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+      bindings = [(name = "KEY", cryptoKey = (
+        raw = "key",
+        algorithm = (json = `{"name":"HMAC","hash":"SHA-256"}
+        ),
+        usages = [encrypt]
+      ))]
+    ))"_kj));
+
+    test.server.allowExperimental();
+    test.expectErrors(R"(
+      service hello: LuaJIT worker "hello" CryptoKey binding "KEY" is unsupported: LuaJIT HMAC CryptoKey supports only sign and verify usages
+    )"_blockquote);
+  }
+}
+
 KJ_TEST("Server: LuaJIT exposes environment-derived bindings") {
 #if _WIN32
   _putenv("WORKERD_LUA_BINDING_PRESENT=environment value");

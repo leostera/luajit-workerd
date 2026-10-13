@@ -48,6 +48,7 @@
 #include <workerd/util/websocket-error-handler.h>
 
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/pem.h>
 
 #include <capnp/compat/json.h>
@@ -114,6 +115,120 @@ static kj::String escapeJsonString(kj::StringPtr text) {
   }
 
   return kj::str("\"", escaped.releaseAsArray(), "\"");
+}
+
+static bool equalsAsciiCaseInsensitive(kj::StringPtr value, kj::StringPtr expected) {
+  if (value.size() != expected.size()) return false;
+  for (size_t i = 0; i < value.size(); ++i) {
+    char left = value[i];
+    char right = expected[i];
+    if (left >= 'A' && left <= 'Z') left += 'a' - 'A';
+    if (right >= 'A' && right <= 'Z') right += 'a' - 'A';
+    if (left != right) return false;
+  }
+  return true;
+}
+
+static kj::String readRequiredJsonStringField(
+    capnp::List<capnp::json::Value::Field, capnp::Kind::STRUCT>::Reader fields,
+    kj::StringPtr name) {
+  bool found = false;
+  kj::String value;
+  for (auto field: fields) {
+    if (field.getName() == name) {
+      KJ_REQUIRE(!found, "duplicate field in LuaJIT CryptoKey algorithm JSON", name);
+      auto fieldValue = field.getValue();
+      KJ_REQUIRE(fieldValue.isString(), "LuaJIT CryptoKey algorithm field must be a string", name);
+      value = kj::str(fieldValue.getString());
+      found = true;
+    }
+  }
+  KJ_REQUIRE(found, "LuaJIT CryptoKey algorithm is missing a string field", name);
+  return value;
+}
+
+static kj::Own<::workerd::rt::luajit::LuaHmacKey> parseLuaHmacKey(
+    config::Worker::Binding::CryptoKey::Reader config) {
+  KJ_REQUIRE(!config.getExtractable(), "LuaJIT only supports non-extractable CryptoKey bindings");
+
+  kj::Array<byte> keyData;
+  KJ_DEFER(if (keyData.size() > 0) OPENSSL_cleanse(keyData.begin(), keyData.size()));
+  switch (config.which()) {
+    case config::Worker::Binding::CryptoKey::RAW:
+      keyData = kj::heapArray<byte>(config.getRaw());
+      break;
+    case config::Worker::Binding::CryptoKey::HEX: {
+      auto decoded = kj::decodeHex(config.getHex());
+      bool hadErrors = decoded.hadErrors;
+      keyData = kj::Array<byte>(kj::mv(decoded));
+      KJ_REQUIRE(!hadErrors, "LuaJIT CryptoKey binding contains invalid hex");
+      break;
+    }
+    case config::Worker::Binding::CryptoKey::BASE64: {
+      auto decoded = kj::decodeBase64(config.getBase64());
+      bool hadErrors = decoded.hadErrors;
+      keyData = kj::Array<byte>(kj::mv(decoded));
+      KJ_REQUIRE(!hadErrors, "LuaJIT CryptoKey binding contains invalid base64");
+      break;
+    }
+    default:
+      KJ_FAIL_REQUIRE("LuaJIT HMAC CryptoKey bindings support raw, hex, or base64 key data");
+  }
+  KJ_REQUIRE(
+      keyData.size() > 0 && keyData.size() <= ::workerd::rt::luajit::LuaRuntime::MAX_HMAC_KEY_BYTES,
+      "LuaJIT CryptoKey key data must be from 1 through 65536 bytes");
+
+  KJ_REQUIRE(config.getAlgorithm().which() == config::Worker::Binding::CryptoKey::Algorithm::JSON,
+      "LuaJIT HMAC CryptoKey algorithm must include a hash in JSON form");
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder message;
+  auto algorithm = message.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(config.getAlgorithm().getJson(), algorithm);
+  KJ_REQUIRE(algorithm.asReader().which() == capnp::JsonValue::OBJECT,
+      "LuaJIT CryptoKey algorithm must be a JSON object");
+  auto object = algorithm.asReader().getObject();
+  auto name = readRequiredJsonStringField(object, "name");
+  KJ_REQUIRE(equalsAsciiCaseInsensitive(name, "HMAC"_kj),
+      "LuaJIT CryptoKey binding only supports the HMAC algorithm");
+
+  kj::Maybe<kj::String> hashName = kj::none;
+  bool foundHash = false;
+  for (auto field: object) {
+    if (field.getName() == "hash") {
+      KJ_REQUIRE(!foundHash, "duplicate hash in LuaJIT CryptoKey algorithm JSON");
+      foundHash = true;
+      auto hash = field.getValue();
+      if (hash.isString()) {
+        hashName = kj::str(hash.getString());
+      } else {
+        KJ_REQUIRE(hash.isObject(), "LuaJIT HMAC hash must be a string or object");
+        hashName = readRequiredJsonStringField(hash.getObject(), "name");
+      }
+    }
+  }
+  kj::String hashAlgorithm =
+      KJ_ASSERT_NONNULL(kj::mv(hashName), "LuaJIT HMAC CryptoKey algorithm is missing its hash");
+  KJ_REQUIRE(equalsAsciiCaseInsensitive(hashAlgorithm, "SHA-1"_kj) ||
+          equalsAsciiCaseInsensitive(hashAlgorithm, "SHA-256"_kj) ||
+          equalsAsciiCaseInsensitive(hashAlgorithm, "SHA-384"_kj) ||
+          equalsAsciiCaseInsensitive(hashAlgorithm, "SHA-512"_kj),
+      "LuaJIT HMAC CryptoKey supports SHA-1, SHA-256, SHA-384, and SHA-512");
+
+  kj::Vector<::workerd::rt::luajit::LuaHmacKeyUsage> usages;
+  for (auto usage: config.getUsages()) {
+    switch (usage) {
+      case config::Worker::Binding::CryptoKey::Usage::SIGN:
+        usages.add(::workerd::rt::luajit::LuaHmacKeyUsage::SIGN);
+        break;
+      case config::Worker::Binding::CryptoKey::Usage::VERIFY:
+        usages.add(::workerd::rt::luajit::LuaHmacKeyUsage::VERIFY);
+        break;
+      default:
+        KJ_FAIL_REQUIRE("LuaJIT HMAC CryptoKey supports only sign and verify usages");
+    }
+  }
+  return kj::heap<::workerd::rt::luajit::LuaHmacKey>(
+      kj::mv(hashAlgorithm), kj::mv(keyData), usages.releaseAsArray());
 }
 
 // Parsed fields from an access blob header value.
@@ -5884,6 +5999,25 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
             .text = kj::str(binding.getJson()),
           });
           break;
+        case config::Worker::Binding::CRYPTO_KEY: {
+          kj::Maybe<kj::Own<::workerd::rt::luajit::LuaHmacKey>> parsedKey = kj::none;
+          KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
+            parsedKey = parseLuaHmacKey(binding.getCryptoKey());
+          })) {
+            unsupportedConfig = true;
+            errorReporter.addError(kj::str("LuaJIT worker \"", name, "\" CryptoKey binding \"",
+                bindingName, "\" is unsupported: ", exception.getDescription()));
+            break;
+          }
+          KJ_IF_SOME(key, kj::mv(parsedKey)) {
+            luaBindings.add(LuaBinding{
+              .name = kj::str(bindingName),
+              .type = LuaBinding::Type::HMAC_KEY,
+              .hmacKey = kj::mv(key),
+            });
+          }
+          break;
+        }
         case config::Worker::Binding::FROM_ENVIRONMENT: {
           const char* value = getenv(binding.getFromEnvironment().cStr());
           if (value == nullptr) {

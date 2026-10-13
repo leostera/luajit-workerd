@@ -20,12 +20,36 @@ struct lua_State;
 
 namespace workerd::rt::luajit {
 
+enum class LuaHmacKeyUsage {
+  SIGN,
+  VERIFY,
+};
+
+// Opaque, non-extractable HMAC key data parsed from a supported CryptoKey binding.
+class LuaHmacKey final {
+ public:
+  LuaHmacKey(
+      kj::String hashAlgorithm, kj::Array<kj::byte> keyData, kj::Array<LuaHmacKeyUsage> usages);
+  ~LuaHmacKey() noexcept;
+  KJ_DISALLOW_COPY_AND_MOVE(LuaHmacKey);
+
+  kj::StringPtr getHashAlgorithm() const;
+  kj::ArrayPtr<const kj::byte> getKeyData() const;
+  kj::ArrayPtr<const LuaHmacKeyUsage> getUsages() const;
+
+ private:
+  kj::String hashAlgorithm;
+  kj::Array<kj::byte> keyData;
+  kj::Array<LuaHmacKeyUsage> usages;
+};
+
 // A config binding copied into a Lua worker's service-global workerd.bindings table.
 struct LuaBinding {
   enum class Type {
     TEXT,
     DATA,
     JSON,
+    HMAC_KEY,
     NULL_VALUE,
     SERVICE,
   };
@@ -33,6 +57,7 @@ struct LuaBinding {
   kj::String name;
   Type type;
   size_t serviceBindingIndex = 0;
+  kj::Own<LuaHmacKey> hmacKey;
   kj::String text;
   kj::Array<kj::byte> data;
 };
