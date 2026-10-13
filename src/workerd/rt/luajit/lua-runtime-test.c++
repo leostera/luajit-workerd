@@ -4,6 +4,7 @@
 
 #include "lua-runtime.h"
 
+#include <workerd/io/observer.h>
 #include <workerd/rt/luajit/lua-worker-interface.h>
 #include <workerd/util/stream-utils.h>
 
@@ -65,6 +66,46 @@ class RecordingSpanObserver final: public SpanObserver {
   kj::Rc<TraceObservation> observation;
 };
 
+class SubrequestAccountingState final: public kj::Refcounted {
+ public:
+  size_t admissionCalls = 0;
+  SubrequestType lastType = SubrequestType::EXTERNAL;
+  bool rejectSubrequest = false;
+  size_t observerCalls = 0;
+  CountSubrequest lastCount = CountSubrequest::NO;
+};
+
+class RecordingSubrequestLimitPolicy final: public SubrequestLimitPolicy {
+ public:
+  explicit RecordingSubrequestLimitPolicy(kj::Rc<SubrequestAccountingState> state)
+      : state(kj::mv(state)) {}
+
+  void checkSubrequest(SubrequestType type) override {
+    ++state->admissionCalls;
+    state->lastType = type;
+    KJ_REQUIRE(!state->rejectSubrequest, "subrequest rejected by request scope");
+  }
+
+ private:
+  kj::Rc<SubrequestAccountingState> state;
+};
+
+class RecordingRequestObserver final: public RequestObserver {
+ public:
+  explicit RecordingRequestObserver(kj::Rc<SubrequestAccountingState> state)
+      : state(kj::mv(state)) {}
+
+  kj::Own<WorkerInterface> wrapSubrequestClient(
+      kj::Own<WorkerInterface> client, CountSubrequest countSubrequest) override {
+    ++state->observerCalls;
+    state->lastCount = countSubrequest;
+    return kj::mv(client);
+  }
+
+ private:
+  kj::Rc<SubrequestAccountingState> state;
+};
+
 class RecordingSubrequestChannel final: public IoChannelFactory::SubrequestChannel {
  public:
   void requireAllowsTransfer() override {}
@@ -75,12 +116,14 @@ class RecordingSubrequestChannel final: public IoChannelFactory::SubrequestChann
   }
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    ++requestsStarted;
     cfBlobJson = metadata.cfBlobJson.map([](const kj::String& value) { return kj::str(value); });
     parentContext = metadata.parentSpan.toSpanContext();
     userParentContext = metadata.userSpanParent.toSpanContext();
     return WorkerInterface::fromException(KJ_EXCEPTION(FAILED, "mock subrequest failure"));
   }
 
+  size_t requestsStarted = 0;
   kj::Maybe<kj::String> cfBlobJson;
   kj::Maybe<tracing::SpanContext> parentContext;
   kj::Maybe<tracing::SpanContext> userParentContext;
@@ -397,13 +440,16 @@ KJ_TEST("LuaJIT outbound fetch propagates request trace context") {
   auto observation = kj::rc<TraceObservation>();
   auto spanObserver = kj::rc<RecordingSpanObserver>(observation.addRef());
   auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  auto accounting = kj::rc<SubrequestAccountingState>();
   kj::HttpHeaderTable headerTable;
   kj::HttpHeaders headers(headerTable);
   IoChannelFactory::SubrequestMetadata metadata;
   metadata.cfBlobJson = kj::str("request-cf-blob");
   metadata.parentSpan = SpanParent(spanObserver.addRef());
   metadata.userSpanParent = SpanParent(spanObserver.addRef());
-  LuaWorkerInterface host(runtime, *outbound, headerTable, kj::mv(metadata));
+  LuaIoContext host(*outbound, headerTable, kj::mv(metadata),
+      kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
+      kj::refcounted<RecordingRequestObserver>(accounting.addRef()));
 
   auto response =
       runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
@@ -422,8 +468,46 @@ KJ_TEST("LuaJIT outbound fetch propagates request trace context") {
   KJ_EXPECT(KJ_ASSERT_NONNULL(outbound->userParentContext).getTraceId() ==
       tracing::TraceId(0x1234, 0x5678));
   KJ_EXPECT(observation->operationNames.size() == 2);
+  KJ_EXPECT(accounting->admissionCalls == 1);
+  KJ_EXPECT(accounting->lastType == SubrequestType::EXTERNAL);
+  KJ_EXPECT(accounting->observerCalls == 1);
+  KJ_EXPECT(accounting->lastCount == CountSubrequest::YES);
+  KJ_EXPECT(outbound->requestsStarted == 1);
   KJ_EXPECT(observation->operationNames[0] == "lua.fetch");
   KJ_EXPECT(observation->operationNames[1] == "lua.fetch");
+}
+
+KJ_TEST("LuaJIT request scope rejects subrequests before routing or observation") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded = pcall(function()
+          workerd.fetch({ url = "https://example.com/denied" })
+        end)
+        return { status = 200, body = tostring(succeeded) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto accounting = kj::rc<SubrequestAccountingState>();
+  accounting->rejectSubrequest = true;
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {},
+      kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
+      kj::refcounted<RecordingRequestObserver>(accounting.addRef()));
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "false");
+  KJ_EXPECT(accounting->admissionCalls == 1);
+  KJ_EXPECT(accounting->lastType == SubrequestType::EXTERNAL);
+  KJ_EXPECT(accounting->observerCalls == 0);
+  KJ_EXPECT(outbound->requestsStarted == 0);
 }
 
 KJ_TEST("LuaJIT worker rejects scheduled and alarm events") {
@@ -432,7 +516,8 @@ KJ_TEST("LuaJIT worker rejects scheduled and alarm events") {
       io.provider->getTimer());
   auto outbound = kj::refcounted<InertSubrequestChannel>();
   kj::HttpHeaderTable headerTable;
-  LuaWorkerInterface worker(runtime, *outbound, headerTable, {});
+  LuaWorkerInterface worker(runtime, *outbound, headerTable, {},
+      kj::heap<UnrestrictedSubrequestLimitPolicy>(), kj::refcounted<RequestObserver>());
 
   KJ_EXPECT(kj::runCatchingExceptions([&]() {
     worker.runScheduled(kj::UNIX_EPOCH, "*"_kj).wait(io.waitScope);

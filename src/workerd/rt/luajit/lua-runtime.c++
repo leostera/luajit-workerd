@@ -6,6 +6,8 @@
 
 #include "lua-worker-interface.h"
 
+#include <workerd/io/observer.h>
+
 #include <lua.hpp>
 
 #include <capnp/compat/json.h>
@@ -621,19 +623,23 @@ kj::Promise<void> respondNotImplemented(kj::HttpService::Response& response,
 
 }  // namespace
 
-LuaWorkerInterface::LuaWorkerInterface(LuaRuntime& runtime,
-    IoChannelFactory::SubrequestChannel& outbound,
+LuaIoContext::LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
     const kj::HttpHeaderTable& headerTable,
-    IoChannelFactory::SubrequestMetadata metadata)
-    : runtime(runtime),
+    IoChannelFactory::SubrequestMetadata metadata,
+    kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
+    kj::Own<workerd::RequestObserver> observer)
+    : subrequestLimitPolicy(kj::mv(subrequestLimitPolicy)),
+      observer(kj::mv(observer)),
+      requestScope(*this->subrequestLimitPolicy, *this->observer),
       outbound(outbound),
       headerTable(headerTable),
       cfBlobJson(kj::mv(metadata.cfBlobJson)),
       parentSpan(kj::mv(metadata.parentSpan)),
       userSpanParent(kj::mv(metadata.userSpanParent)) {}
 
-IoChannelFactory::SubrequestMetadata LuaWorkerInterface::makeSubrequestMetadata(
-    TraceContext& tracing) {
+LuaIoContext::~LuaIoContext() noexcept(false) = default;
+
+IoChannelFactory::SubrequestMetadata LuaIoContext::makeSubrequestMetadata(TraceContext& tracing) {
   return IoChannelFactory::SubrequestMetadata{
     .cfBlobJson = cfBlobJson.map([](const kj::String& value) { return kj::str(value); }),
     .parentSpan = tracing.getInternalSpanParent(),
@@ -641,7 +647,7 @@ IoChannelFactory::SubrequestMetadata LuaWorkerInterface::makeSubrequestMetadata(
   };
 }
 
-kj::Promise<LuaHttpResponse> LuaWorkerInterface::fetch(LuaHttpRequest request) {
+kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {
   kj::HttpMethod method = kj::HttpMethod::GET;
   KJ_IF_SOME(parsedMethod, kj::tryParseHttpMethod(request.method)) {
     method = parsedMethod;
@@ -657,9 +663,12 @@ kj::Promise<LuaHttpResponse> LuaWorkerInterface::fetch(LuaHttpRequest request) {
     headers.addPtrPtr(header.name, header.value);
   }
 
+  requestScope.checkSubrequest(SubrequestType::EXTERNAL);
   auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
                      .newChild(kj::ConstString(kj::str("lua.fetch")));
-  auto client = asHttpClient(outbound.startRequest(makeSubrequestMetadata(tracing)));
+  auto subrequest = requestScope.wrapSubrequestClient(
+      outbound.startRequest(makeSubrequestMetadata(tracing)), CountSubrequest::YES);
+  auto client = asHttpClient(kj::mv(subrequest));
   auto outgoing =
       client->request(method, request.url, headers, static_cast<uint64_t>(request.body.size()));
   if (outgoing.body.get() != nullptr) {
@@ -681,6 +690,19 @@ kj::Promise<LuaHttpResponse> LuaWorkerInterface::fetch(LuaHttpRequest request) {
   };
 }
 
+LuaWorkerInterface::LuaWorkerInterface(LuaRuntime& runtime,
+    IoChannelFactory::SubrequestChannel& outbound,
+    const kj::HttpHeaderTable& headerTable,
+    IoChannelFactory::SubrequestMetadata metadata,
+    kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
+    kj::Own<workerd::RequestObserver> observer)
+    : runtime(runtime),
+      hostOperations(outbound,
+          headerTable,
+          kj::mv(metadata),
+          kj::mv(subrequestLimitPolicy),
+          kj::mv(observer)) {}
+
 kj::Promise<void> LuaWorkerInterface::request(kj::HttpMethod method,
     kj::StringPtr url,
     const kj::HttpHeaders& headers,
@@ -696,7 +718,8 @@ kj::Promise<void> LuaWorkerInterface::request(kj::HttpMethod method,
   auto responseHeaders = requestHeaders.cloneShallow();
   responseHeaders.clear();
   auto body = co_await requestBody.readAllBytes(LuaRuntime::MAX_HTTP_BODY_BYTES);
-  auto result = co_await runtime.fetch(methodName, urlCopy, requestHeaders, body, getPtr());
+  auto result =
+      co_await runtime.fetch(methodName, urlCopy, requestHeaders, body, hostOperations.getPtr());
 
   for (auto& header: result.headers) {
     responseHeaders.add(kj::mv(header.name), kj::mv(header.value));

@@ -209,6 +209,7 @@ class IoContext_IncomingRequest final {
  private:
   kj::Own<IoContext> context;
   kj::Own<RequestObserver> metrics;
+  RequestScope requestScope;
   kj::Maybe<kj::Own<BaseTracer>> workerTracer;
   kj::Rc<IoChannelFactory> ioChannelFactory;
   kj::Maybe<kj::Own<AccessInfo>> accessInfo;

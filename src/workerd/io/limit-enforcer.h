@@ -5,6 +5,7 @@
 #pragma once
 
 #include <workerd/io/outcome.capnp.h>
+#include <workerd/io/request-scope.h>
 #include <workerd/io/tracked-wasm-instance.h>
 
 #include <v8-isolate.h>
@@ -128,8 +129,12 @@ class IsolateLimitEnforcer: public kj::Refcounted {
 };
 
 // Abstract interface that enforces resource limits on a IoContext.
-class LimitEnforcer {
+class LimitEnforcer: public SubrequestLimitPolicy {
  public:
+  void checkSubrequest(SubrequestType type) final {
+    newSubrequest(type == SubrequestType::IN_HOUSE);
+  }
+
   // Called just after taking the isolate lock, before executing JavaScript code, to enforce
   // limits on that code execution, particularly the CPU limit. The returned `Own<void>` should
   // be dropped when JavaScript is done, before unlocking the isolate.

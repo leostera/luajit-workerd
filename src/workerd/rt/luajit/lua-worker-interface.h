@@ -5,17 +5,50 @@
 #pragma once
 
 #include <workerd/io/io-channels.h>
+#include <workerd/io/request-scope.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/rt/luajit/lua-runtime.h>
 
+namespace workerd {
+class RequestObserver;
+}
+
 namespace workerd::rt::luajit {
 
-class LuaWorkerInterface final: public WorkerInterface, public LuaHostOperations {
+// Request-scoped Lua host operations. This composes the shared request accounting/observer scope
+// with Lua's own route and trace metadata, without depending on JS worker or isolate state.
+class LuaIoContext final: public LuaHostOperations {
+ public:
+  LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
+      const kj::HttpHeaderTable& headerTable,
+      IoChannelFactory::SubrequestMetadata metadata,
+      kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
+      kj::Own<workerd::RequestObserver> observer);
+  ~LuaIoContext() noexcept(false) override;
+
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
+
+ private:
+  IoChannelFactory::SubrequestMetadata makeSubrequestMetadata(TraceContext& tracing);
+
+  kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy;
+  kj::Own<workerd::RequestObserver> observer;
+  RequestScope requestScope;
+  IoChannelFactory::SubrequestChannel& outbound;
+  const kj::HttpHeaderTable& headerTable;
+  kj::Maybe<kj::String> cfBlobJson;
+  SpanParent parentSpan;
+  SpanParent userSpanParent;
+};
+
+class LuaWorkerInterface final: public WorkerInterface {
  public:
   LuaWorkerInterface(LuaRuntime& runtime,
       IoChannelFactory::SubrequestChannel& outbound,
       const kj::HttpHeaderTable& headerTable,
-      IoChannelFactory::SubrequestMetadata metadata);
+      IoChannelFactory::SubrequestMetadata metadata,
+      kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
+      kj::Own<workerd::RequestObserver> observer);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
@@ -31,17 +64,10 @@ class LuaWorkerInterface final: public WorkerInterface, public LuaHostOperations
   kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override;
   kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override;
   kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override;
-  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
 
  private:
-  IoChannelFactory::SubrequestMetadata makeSubrequestMetadata(TraceContext& tracing);
-
   LuaRuntime& runtime;
-  IoChannelFactory::SubrequestChannel& outbound;
-  const kj::HttpHeaderTable& headerTable;
-  kj::Maybe<kj::String> cfBlobJson;
-  SpanParent parentSpan;
-  SpanParent userSpanParent;
+  LuaIoContext hostOperations;
 };
 
 }  // namespace workerd::rt::luajit
