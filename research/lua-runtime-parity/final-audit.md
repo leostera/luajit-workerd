@@ -1,6 +1,6 @@
 # LuaJIT host-capability parity audit
 
-**Status: incomplete.** This audit extends the prior matrix audit at `98760d713` with the shared `RequestScope` implementation (`7c7a49353`) and opt-in inbound request-body streaming (`cbb9da4b2`) on `leostera/luajit`. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report summarizes verified coverage and does not upgrade partial or blocked rows into parity claims.
+**Status: incomplete.** This audit extends the prior matrix audit at `98760d713` with the shared `RequestScope` implementation (`7c7a49353`), opt-in inbound request-body streaming (`cbb9da4b2`), and backpressured outbound pass-through (`6fc046dfd`) on `leostera/luajit`. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report summarizes verified coverage and does not upgrade partial or blocked rows into parity claims.
 
 ## Coverage review
 
