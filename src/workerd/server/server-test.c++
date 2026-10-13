@@ -978,6 +978,18 @@ KJ_TEST("Server: LuaJIT worker rejects unsupported config") {
   )"_blockquote);
 }
 
+KJ_TEST("Server: LuaJIT rejects Durable Object storage") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+    durableObjectStorage = (inMemory = void)
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.expectErrors(R"(
+    service hello: LuaJIT worker "hello" does not support Durable Objects.
+  )"_blockquote);
+}
+
 KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {
   TestServer test(singleWorker(R"((
     luaScript = "return { fetch = function() local b = workerd.bindings; return { status = 200, body = b.GREETING .. ':' .. tostring(b.CONFIG.enabled) .. ':' .. tostring(b.CONFIG.nilValue == workerd.null) } end }",

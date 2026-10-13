@@ -4,6 +4,7 @@
 
 #include "lua-runtime.h"
 
+#include <workerd/rt/luajit/lua-worker-interface.h>
 #include <workerd/util/stream-utils.h>
 
 #include <kj/async-io.h>
@@ -17,6 +18,20 @@ namespace {
 kj::String asString(kj::ArrayPtr<const kj::byte> bytes) {
   return kj::heapString(reinterpret_cast<const char*>(bytes.begin()), bytes.size());
 }
+
+class InertSubrequestChannel final: public IoChannelFactory::SubrequestChannel {
+ public:
+  void requireAllowsTransfer() override {}
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    KJ_UNREACHABLE;
+  }
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    KJ_UNREACHABLE;
+  }
+};
 
 class TestLuaHostOperations final: public LuaHostOperations {
  public:
@@ -303,6 +318,21 @@ KJ_TEST("LuaJIT can issue multiple outbound fetches in one request") {
   hostOperations.complete(1, "second");
   auto response = request.wait(io.waitScope);
   KJ_EXPECT(asString(response.body) == "first:second");
+}
+
+KJ_TEST("LuaJIT worker rejects scheduled and alarm events") {
+  auto io = kj::setupAsyncIo();
+  LuaRuntime runtime("return { fetch = function() return { status = 200, body = '' } end }"_kj,
+      io.provider->getTimer());
+  auto outbound = kj::refcounted<InertSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  LuaWorkerInterface worker(runtime, *outbound, headerTable, {});
+
+  KJ_EXPECT(kj::runCatchingExceptions([&]() {
+    worker.runScheduled(kj::UNIX_EPOCH, "*"_kj).wait(io.waitScope);
+  }) != kj::none);
+  KJ_EXPECT(kj::runCatchingExceptions(
+                [&]() { worker.runAlarm(kj::UNIX_EPOCH, 0).wait(io.waitScope); }) != kj::none);
 }
 
 KJ_TEST("LuaJIT HTTP handler receives requests and returns status, headers, and body") {
