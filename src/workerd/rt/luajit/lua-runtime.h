@@ -87,6 +87,10 @@ class LuaHostOperations: public kj::PtrTarget {
   // Use the request's configured entropy source.
   virtual void fillRandomBytes(kj::ArrayPtr<kj::byte> output) = 0;
   virtual kj::String generateRandomUuid() = 0;
+  // Keep serialized metadata host-neutral and defer decoding until Lua accesses request.cf.
+  virtual kj::Maybe<kj::String> getRequestCfJson() const {
+    return kj::none;
+  }
   virtual bool hasRequestBodyStream() const = 0;
   // Read up to maxBytes from the current inbound request body; return none at EOF.
   virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) = 0;

@@ -194,6 +194,10 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
     return kj::str("01234567-89ab-4cde-8fab-0123456789ab");
   }
 
+  kj::Maybe<kj::String> getRequestCfJson() const override {
+    return requestCfJson.map([](const kj::String& value) { return kj::str(value); });
+  }
+
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
     if (request.bodyProducer != kj::none) {
       KJ_IF_SOME(producer, request.bodyProducer) {
@@ -223,6 +227,7 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   kj::Maybe<LuaHttpRequest> lastRequest;
   kj::Vector<kj::Array<kj::byte>> bodyProducerChunks;
   bool bodyProducerReachedEof = false;
+  kj::Maybe<kj::String> requestCfJson = kj::none;
   size_t randomBytesCalls = 0;
   size_t randomUuidCalls = 0;
 };
@@ -265,6 +270,62 @@ class InterleavingLuaHostOperations final: public LuaHostOperationsWithoutReques
 
   kj::Vector<kj::Own<kj::PromiseFulfiller<LuaHttpResponse>>> pending;
 };
+
+KJ_TEST("LuaJIT request.cf decodes per-request metadata as a fresh Lua table") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        if request.cf == nil then return { status = 200, body = "missing" } end
+        local country = request.cf.country
+        request.cf.country = "local mutation"
+        return { status = 200,
+          body = country .. ":" .. request.cf.features[1] .. ":" ..
+            tostring(request.cf.value == workerd.null) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  TestLuaHostOperations host;
+  host.requestCfJson = kj::str(R"({"country":"US","features":["workers","http"],"value":null})");
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto first =
+      runtime.fetch("GET"_kj, "/first"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+  auto second =
+      runtime.fetch("GET"_kj, "/second"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+  KJ_EXPECT(asString(first.body) == "US:workers:true");
+  KJ_EXPECT(asString(second.body) == "US:workers:true");
+
+  host.requestCfJson = kj::none;
+  auto withoutMetadata =
+      runtime.fetch("GET"_kj, "/none"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+  KJ_EXPECT(asString(withoutMetadata.body) == "missing");
+}
+
+KJ_TEST("LuaJIT malformed request.cf metadata raises a catchable Lua error") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        local succeeded, value = pcall(function() return request.cf end)
+        return { status = 200, body = tostring(succeeded) .. ":" .. type(value) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  TestLuaHostOperations host;
+  host.requestCfJson = kj::str("not JSON");
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/invalid-cf"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) == "false:string");
+}
 
 KJ_TEST("LuaJIT inbound request bodies stream in async bounded chunks") {
   auto io = kj::setupAsyncIo();

@@ -1,7 +1,7 @@
 # LuaJIT host-capability integration: architecture and implementation
 
 - **Status:** Architecture and implementation note for experimental Lua host capabilities; this document does not define a stable API.
-- **Source snapshot:** workerd `75d194b62` (`leostera/luajit`), inspected 2026-10-13.
+- **Source snapshot:** workerd `631d8bee2` (`leostera/luajit`), inspected 2026-10-13.
 - **Related checklist:** [feature-matrix.md](feature-matrix.md).
 
 ## Decision
@@ -42,7 +42,7 @@ The current constructor receives the source, simple bindings, timer, configured 
 
 `workerd.sleep()` is implemented by the coroutine bridge and the runtime timer; response stream handles are owned by the coroutine invocation. KJ cancellation tears down the in-flight promise and request-local streams. Keep this narrower than `IoContext`; do not transplant its `Worker::Lock` and isolate lifecycle into Lua. `IoChannelFactory` and `RequestObserver` remain host-side types and are not exposed to Lua code.
 
-The current `LuaHostOperations` interface in `src/workerd/rt/luajit/lua-runtime.h` contains the Lua-native HTTP request/response types, an async `fetch()` operation, and synchronous random-byte/UUID operations. `LuaIoContext` delegates randomness to the same injected `kj::EntropySource` used by the standard request context. It does not expose `sleep()` or `onAbort()` as virtual methods: timer suspension is handled by the runtime bridge, and cancellation is expressed through KJ promise lifetime.
+The current `LuaHostOperations` interface in `src/workerd/rt/luajit/lua-runtime.h` contains the Lua-native HTTP request/response types, an async `fetch()` operation, synchronous random-byte/UUID operations, and optional serialized CF request metadata. `LuaIoContext` delegates randomness to the same injected `kj::EntropySource` used by the standard request context. It does not expose `sleep()` or `onAbort()` as virtual methods: timer suspension is handled by the runtime bridge, and cancellation is expressed through KJ promise lifetime.
 
 ### 3. Lua runtime and coroutine bridge
 

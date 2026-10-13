@@ -1155,6 +1155,33 @@ KJ_TEST("Server: LuaJIT randomBytes uses the configured entropy source") {
       R"(HTTP/1\.1 200 LuaJIT[\s\S]*16:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})");
 }
 
+KJ_TEST("Server: LuaJIT exposes per-request CF blob metadata") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function(request) return { status = 200, body = request.cf.country .. ':' .. request.cf.clientIp } end }"
+        )
+      )
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "lua", http = (cfBlobHeader = "CF-Blob"))
+    ]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send(R"(
+    GET / HTTP/1.1
+    Host: example.com
+    CF-Blob: {"country":"US","clientIp":"192.0.2.1"}
+
+  )"_blockquote);
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*US:192\.0\.2\.1)");
+}
+
 KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {
   TestServer test(singleWorker(R"((
     luaScript = "return { fetch = function() local b = workerd.bindings; return { status = 200, body = b.GREETING .. ':' .. tostring(b.CONFIG.enabled) .. ':' .. tostring(b.CONFIG.nilValue == workerd.null) } end }",

@@ -330,6 +330,52 @@ void pushJsonValue(lua_State* state, capnp::JsonValue::Reader value, size_t dept
   KJ_UNREACHABLE;
 }
 
+int getRequestCf(lua_State* state) {
+  if (lua_type(state, 2) != LUA_TSTRING) {
+    lua_pushnil(state);
+    return 1;
+  }
+  size_t nameSize = 0;
+  const char* name = lua_tolstring(state, 2, &nameSize);
+  if (kj::StringPtr(name, nameSize) != "cf") {
+    lua_pushnil(state);
+    return 1;
+  }
+
+  int originalTop = lua_gettop(state);
+  {
+    size_t jsonSize = 0;
+    const char* json = lua_tolstring(state, lua_upvalueindex(1), &jsonSize);
+    try {
+      capnp::JsonCodec codec;
+      capnp::MallocMessageBuilder arena;
+      auto root = arena.initRoot<capnp::JsonValue>();
+      codec.decodeRaw(kj::StringPtr(json, jsonSize), root);
+      KJ_REQUIRE(root.asReader().which() == capnp::JsonValue::OBJECT,
+          "LuaJIT request.cf metadata must be a JSON object");
+      pushJsonValue(state, root.asReader());
+      lua_pushvalue(state, -1);
+      lua_setfield(state, 1, "cf");
+      return 1;
+    } catch (const kj::Exception& exception) {
+      lua_settop(state, originalTop);
+      auto description = exception.getDescription();
+      lua_pushlstring(state, description.begin(), description.size());
+    }
+  }
+
+  return lua_error(state);
+}
+
+void installRequestCfJson(lua_State* state, int tableIndex, kj::StringPtr json) {
+  tableIndex = absoluteIndex(state, tableIndex);
+  lua_createtable(state, 0, 1);
+  lua_pushlstring(state, json.begin(), json.size());
+  lua_pushcclosure(state, getRequestCf, 1);
+  lua_setfield(state, -2, "__index");
+  lua_setmetatable(state, tableIndex);
+}
+
 void pushLuaBindings(lua_State* state, kj::ArrayPtr<const LuaBinding> bindings) {
   KJ_REQUIRE(bindings.size() <= INT_MAX, "too many Lua bindings");
   lua_getglobal(state, "workerd");
@@ -770,7 +816,7 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
   }
 
   lua_rawgeti(coroutine, LUA_REGISTRYINDEX, fetchHandlerRef);
-  lua_createtable(coroutine, 0, hasRequestBodyStream ? 5 : 4);
+  lua_createtable(coroutine, 0, hasRequestBodyStream ? 6 : 5);
   setStringField(coroutine, "method", method);
   setStringField(coroutine, "url", url);
 
@@ -789,6 +835,12 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
 
   pushRequestHeaders(coroutine, headers);
   lua_setfield(coroutine, -2, "headers");
+
+  KJ_IF_SOME(host, hostOperations) {
+    KJ_IF_SOME(cfJson, host->getRequestCfJson()) {
+      installRequestCfJson(coroutine, -1, cfJson);
+    }
+  }
 
   kj::Vector<kj::Own<kj::AsyncInputStream>> responseBodies;
   int status = lua_resume(coroutine, 1);
@@ -967,6 +1019,10 @@ void LuaIoContext::fillRandomBytes(kj::ArrayPtr<kj::byte> output) {
 
 kj::String LuaIoContext::generateRandomUuid() {
   return workerd::randomUUID(entropySource);
+}
+
+kj::Maybe<kj::String> LuaIoContext::getRequestCfJson() const {
+  return cfBlobJson.map([](const kj::String& value) { return kj::str(value); });
 }
 
 void LuaIoContext::setRequestBodyStream(kj::AsyncInputStream& stream) {

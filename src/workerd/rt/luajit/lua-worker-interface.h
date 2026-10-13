@@ -32,6 +32,7 @@ class LuaIoContext final: public LuaHostOperations {
   kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override;
   void fillRandomBytes(kj::ArrayPtr<kj::byte> output) override;
   kj::String generateRandomUuid() override;
+  kj::Maybe<kj::String> getRequestCfJson() const override;
 
   void setRequestBodyStream(kj::AsyncInputStream& stream);
   void clearRequestBodyStream();
