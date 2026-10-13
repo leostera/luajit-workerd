@@ -108,6 +108,8 @@ A phased composite shape avoids that cutover:
 - Scope the shared component to one `IncomingRequest`/event even when an actor's outer `IoContext` persists across multiple events; do not leak subrequest counts, observers, or trace state between invocations.
 - Keep JSG/V8 memory accounting and actor-specific behavior in the JS/actor side; do not imply those capabilities exist for Lua.
 
+The existing `IoContext_IncomingRequest` is a useful extraction seam: it already owns per-invocation metrics, the channel factory, worker tracer, and invocation spans while pointing back to the longer-lived `IoContext`. Extract only the runtime-neutral request services from that object. Keep `drain()`, scheduled/alarm handling, actor gates, and waitUntil semantics on the JS/actor side. A `LuaIoContext` should compose one such request scope per HTTP invocation with its Lua coroutine/stream lifetime.
+
 A `RequestScope` should expose only the shared host operations:
 
 - Admit a subrequest using the applicable limit policy before dispatch.
