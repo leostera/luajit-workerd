@@ -94,6 +94,22 @@ A Lua `workerd.fetch()` must use a configured `ServiceDesignator` channel, not `
 
 The adapter does not yet reuse `IoContext::getSubrequest()` or provide an equivalent request observer/accounting adapter. Source inspection shows `IoContext` applies `LimitEnforcer::newSubrequest()`, wraps clients with `RequestObserver::wrapSubrequestClient()`, and attaches V8 external-memory adjustments when a JS lock is held. `IoChannelFactory::SubrequestMetadata` carries trace and compatibility data but no request-scope capability; `LuaWorkerService::startRequest()` receives only this metadata and the service's linked outbound route. The `LimitEnforcer` contract itself depends on `jsg::Lock` and `IoContext`, so exposing it directly to Lua would leak JSG types. `LuaWorkerService` has no `IoContext` or `Worker::Isolate`, and constructing a fake one would violate the runtime boundary. A runtime-neutral request-scope API must be factored and passed explicitly through service dispatch before Lua can preserve applicable limits and observer hooks. Inbound/outbound request bodies also remain buffered. Keep this capability experimental and document those gaps; do not claim JavaScript-fetch parity. Do not instantiate a fake V8 worker to get there.
 
+## Request scope: reuse IoContext behavior without constructing IoContext
+
+The Lua service should reuse the applicable subrequest behavior of `IoContext`, but it cannot currently instantiate an `IoContext` for itself. `IoContext` is constructed by `WorkerEntrypoint::init()` with a `Worker`, `ThreadContext`, and `LimitEnforcer`; its constructor consults the worker isolate, and its broader lifecycle manages JS locks, GC/I/O ownership, actor gates, and waitUntil work. A fake `Worker`/V8 isolate or an implicit `IoContext::current()` lookup would couple Lua to machinery it does not own.
+
+The reusable unit is a narrower, invocation-scoped **request scope**, not the whole `IoContext`:
+
+- It admits a subrequest using the applicable limit policy before dispatch.
+- It establishes/propagates the child trace context.
+- It wraps the resulting client with the current request's `RequestObserver`/metrics hooks.
+- It ties pending subrequest work to request cancellation and lifetime.
+- It does not expose JSG, V8, JS locks, or `IoContext` to `LuaRuntime`/LJGlue. V8 external-memory adjustment remains on the JS-specific path.
+
+A request-scope operation should accept a factory for the **already-linked Lua outbound route**, plus the operation/tracing metadata and accounting classification. The scope wraps that client; it must not substitute the caller's global outbound route for the Lua service's configured `globalOutbound`. `IoContext` can adapt its existing `getSubrequest()` behavior to this interface for worker-originated calls. The server must also provide an appropriate root scope for directly addressed Lua requests rather than leaving those requests with different semantics.
+
+Pass the scope explicitly as a request-lifetime capability through service dispatch (or an equivalent typed request object). Its lifetime must be bounded by the Lua invocation so cancellation tears down streams and clients before the scope disappears. The exact ownership path still needs validation against `WorkerInterface` teardown and the current request metadata plumbing; this is a proposed seam, not implemented code. Tests should cover both a direct Lua request and a Lua service-binding request, verify the configured route is retained, observe subrequest-limit and metrics behavior, and prove disconnect cancellation releases the operation. Do not use ambient thread-local context.
+
 ## Configuration and capability ownership
 
 - Parse text, data, and JSON bindings into typed descriptors during config setup; reject duplicates and unsupported types before serving. Treat service/storage, secret-derived, and cryptographic bindings separately because they require request accounting, redaction, or key-usage designs.
