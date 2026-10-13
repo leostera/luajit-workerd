@@ -98,13 +98,23 @@ The adapter does not yet reuse `IoContext::getSubrequest()` or provide an equiva
 
 The Lua service should reuse the applicable subrequest behavior of `IoContext`, but it cannot currently instantiate an `IoContext` for itself. `IoContext` is constructed by `WorkerEntrypoint::init()` with a `Worker`, `ThreadContext`, and `LimitEnforcer`; its constructor consults the worker isolate, and its broader lifecycle manages JS locks, GC/I/O ownership, actor gates, and waitUntil work. A fake `Worker`/V8 isolate or an implicit `IoContext::current()` lookup would couple Lua to machinery it does not own.
 
-The reusable unit is a narrower, invocation-scoped **request scope**, not the whole `IoContext`:
+The useful direction is a composite runtime context with JS- and Lua-specific lifetimes, but the reusable unit should be a narrower, invocation-scoped **request scope**, not the whole existing `IoContext`. The current class is `final`, constructed around `Worker`/`LimitEnforcer`, and combines request I/O with JS locks, actor state, inspector behavior, GC/I/O ownership, and waitUntil. On this branch, a source search found references to `IoContext` across 173 workerd files and more than 450 `current()`/`tryCurrent()` call sites. Turning that entire class into an interface or renaming it wholesale would be a broad migration with many JS-only consumers.
 
-- It admits a subrequest using the applicable limit policy before dispatch.
-- It establishes/propagates the child trace context.
-- It wraps the resulting client with the current request's `RequestObserver`/metrics hooks.
-- It ties pending subrequest work to request cancellation and lifetime.
-- It does not expose JSG, V8, JS locks, or `IoContext` to `LuaRuntime`/LJGlue. V8 external-memory adjustment remains on the JS-specific path.
+A phased composite shape avoids that cutover:
+
+- Keep the existing `IoContext` as the JS/actor-facing context initially, but move the runtime-neutral invocation services behind a small interface/component (the name `RequestScope` below is provisional).
+- Make the JS context delegate the shared subrequest, trace/observer, and I/O-lifetime behavior to that component without changing existing JS call sites.
+- Give each Lua invocation a `LuaIoContext` that composes the same request-scope component with Lua coroutine/stream lifetime management, without a `Worker`, isolate, actor API, or JS lock.
+- Scope the shared component to one `IncomingRequest`/event even when an actor's outer `IoContext` persists across multiple events; do not leak subrequest counts, observers, or trace state between invocations.
+- Keep JSG/V8 memory accounting and actor-specific behavior in the JS/actor side; do not imply those capabilities exist for Lua.
+
+A `RequestScope` should expose only the shared host operations:
+
+- Admit a subrequest using the applicable limit policy before dispatch.
+- Establish and propagate the child trace context.
+- Wrap the resulting client with the current request's `RequestObserver`/metrics hooks.
+- Tie pending subrequest work to request cancellation and lifetime.
+- Avoid exposing JSG, V8, JS locks, or `IoContext` to `LuaRuntime`/LJGlue. V8 external-memory adjustment remains on the JS-specific path.
 
 A request-scope operation should accept a factory for the **already-linked Lua outbound route**, plus the operation/tracing metadata and accounting classification. The scope wraps that client; it must not substitute the caller's global outbound route for the Lua service's configured `globalOutbound`. The scope belongs to the Lua invocation itself: when Lua is called through a service binding, it must not borrow the caller's `IoContext`, which would charge the subrequest to the wrong worker/request. Instead, factor the reusable request-scope behavior from the JS `IoContext` path and construct a fresh scope for each Lua invocation, both for direct HTTP entry and service-dispatched calls.
 
@@ -121,7 +131,7 @@ Pass the scope explicitly as a request-lifetime capability through service dispa
 ## Implementation order and gates
 
 1. Keep the linked `ServiceDesignator` and request-scoped KJ adapter, without changing JS `WorkerService` behavior.
-2. Complete a runtime-neutral request context for subrequest observer/accounting and cancellation, or document a verified alternative. Keep `workerd.sleep` as the regression test.
+2. Complete the runtime-neutral `RequestScope` for subrequest observation/accounting and cancellation, or document a verified alternative. Keep `workerd.sleep` as the regression test.
 3. Extend the currently streamed outbound response-body path to a justified Lua-native request-body streaming contract if preserving the `fetch(request)` surface allows it.
 4. Add individual binding adapters on the same capability contract. Storage, actors, RPC, queues, and lifecycle events remain separate designs when their semantics require more than a request channel.
 
