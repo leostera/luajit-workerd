@@ -1,7 +1,7 @@
 # LuaJIT host-capability integration: architecture and implementation
 
 - **Status:** Architecture and implementation note for experimental Lua host capabilities; this document does not define a stable API.
-- **Source snapshot:** workerd `7c7a49353` (`leostera/luajit`), inspected 2026-10-13.
+- **Source snapshot:** workerd `f7cc6dd86` (`leostera/luajit`), inspected 2026-10-13.
 - **Related checklist:** [feature-matrix.md](feature-matrix.md).
 
 ## Decision
@@ -71,7 +71,7 @@ return {
 
 Keep host operations in the existing `workerd` namespace (for example, `workerd.sleep`, and a Lua-designed async `workerd.fetch`). Simple text, binary-data, and JSON bindings are exposed through `workerd.bindings`; JSON `null` is represented by `workerd.null`. This preserves the `fetch(request)` signature without adding JavaScript-shaped `env` or `ctx` parameters. Binding values are installed when the service's Lua state starts and therefore share Lua's service-global mutability/lifetime. Each future capability must make its config and request-scoped availability explicit.
 
-Do not mirror JavaScript `Request`, `Response`, `Promise`, `ReadableStream`, or DOM object semantics by name unless a written Lua contract and tests establish the needed equivalence. Prefer simple Lua values and small resource wrappers with explicit close/cancel behavior.
+Do not mirror JavaScript `Request`, `Response`, `Promise`, `ReadableStream`, or DOM object semantics by name unless a written Lua contract and tests establish the needed equivalence. Prefer simple Lua values and small resource wrappers with explicit close/cancel behavior. `workerd.parseUrl(url[, base])` is a synchronous, narrow adapter over `kj::Url`: it converts parsed URL components into plain Lua tables and deliberately does not expose the KJ type or promise WHATWG URL semantics.
 
 ## Outbound HTTP and accounting
 

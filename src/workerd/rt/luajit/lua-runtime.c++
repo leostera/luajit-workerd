@@ -12,6 +12,7 @@
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
+#include <kj/compat/url.h>
 #include <kj/debug.h>
 
 #include <climits>
@@ -156,6 +157,89 @@ void pushRequestHeaders(lua_State* state, const kj::HttpHeaders& headers) {
     setStringField(state, "value", value);
     lua_rawseti(state, -2, index++);
   });
+}
+
+int pushUrlParseError(lua_State* state, kj::StringPtr message) {
+  lua_pushnil(state);
+  lua_pushlstring(state, message.begin(), message.size());
+  return 2;
+}
+
+void pushParsedUrl(lua_State* state, kj::Url& url) {
+  KJ_REQUIRE(url.path.size() <= INT_MAX && url.query.size() <= INT_MAX,
+      "parsed URL has too many components");
+  lua_createtable(state, 0, 9);
+  setStringField(state, "href", url.toString());
+  setStringField(state, "scheme", url.scheme);
+  setStringField(state, "host", url.host);
+
+  lua_createtable(state, static_cast<int>(url.path.size()), 0);
+  int index = 1;
+  for (auto& component: url.path) {
+    lua_pushlstring(state, component.begin(), component.size());
+    lua_rawseti(state, -2, index++);
+  }
+  lua_setfield(state, -2, "path");
+
+  lua_createtable(state, static_cast<int>(url.query.size()), 0);
+  index = 1;
+  for (auto& parameter: url.query) {
+    lua_createtable(state, 0, 2);
+    setStringField(state, "name", parameter.name);
+    if (parameter.value != nullptr) setStringField(state, "value", parameter.value);
+    lua_rawseti(state, -2, index++);
+  }
+  lua_setfield(state, -2, "query");
+
+  lua_pushboolean(state, url.hasTrailingSlash);
+  lua_setfield(state, -2, "hasTrailingSlash");
+  KJ_IF_SOME(fragment, url.fragment) {
+    setStringField(state, "fragment", fragment);
+  }
+  KJ_IF_SOME(userInfo, url.userInfo) {
+    setStringField(state, "username", userInfo.username);
+    KJ_IF_SOME(password, userInfo.password) {
+      setStringField(state, "password", password);
+    }
+  }
+}
+
+int parseUrl(lua_State* state) {
+  int argumentCount = lua_gettop(state);
+  if (argumentCount < 1 || argumentCount > 2 || lua_type(state, 1) != LUA_TSTRING ||
+      (argumentCount == 2 && lua_type(state, 2) != LUA_TSTRING)) {
+    return pushUrlParseError(
+        state, "workerd.parseUrl() expects a URL string and optional base URL string");
+  }
+
+  size_t inputLength = 0;
+  const char* inputBytes = lua_tolstring(state, 1, &inputLength);
+  kj::StringPtr input(inputBytes, inputLength);
+
+  try {
+    kj::Maybe<kj::Url> parsed = kj::none;
+    if (argumentCount == 1) {
+      parsed = kj::Url::tryParse(input);
+    } else {
+      size_t baseLength = 0;
+      const char* baseBytes = lua_tolstring(state, 2, &baseLength);
+      auto base = kj::Url::tryParse(kj::StringPtr(baseBytes, baseLength));
+      if (base == kj::none) {
+        return pushUrlParseError(state, "workerd.parseUrl() base must be an absolute remote URL");
+      }
+      KJ_IF_SOME(baseUrl, base) {
+        parsed = baseUrl.tryParseRelative(input);
+      }
+    }
+
+    KJ_IF_SOME(url, parsed) {
+      pushParsedUrl(state, url);
+      return 1;
+    }
+    return pushUrlParseError(state, "workerd.parseUrl() could not parse URL");
+  } catch (const kj::Exception& exception) {
+    return pushUrlParseError(state, exception.getDescription());
+  }
 }
 
 kj::Duration readSleepDelay(lua_State* state) {
@@ -595,6 +679,10 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<L
   KJ_REQUIRE(asyncApiEvaluationStatus == 0,
       "failed to evaluate LuaJIT async API:", readLuaErrorMessage(state));
   pushLuaBindings(state, bindings.asPtr());
+  lua_getglobal(state, "workerd");
+  lua_pushcfunction(state, parseUrl);
+  lua_setfield(state, -2, "parseUrl");
+  lua_pop(state, 1);
 
   int loadStatus = luaL_loadbuffer(state, moduleSource.begin(), moduleSource.size(), "worker.lua");
   if (loadStatus != 0) {

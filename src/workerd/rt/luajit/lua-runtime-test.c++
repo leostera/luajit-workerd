@@ -1000,6 +1000,48 @@ KJ_TEST("LuaJIT HTTP handler receives requests and returns status, headers, and 
   KJ_EXPECT(response.headers[0].value == "x-input:received");
 }
 
+KJ_TEST("LuaJIT parses remote URLs and relative references") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local absolute = assert(workerd.parseUrl(
+          "https://user:pass@example.com:8443/a%20b/b/?x=1&x=two&flag#frag"))
+        local relative = assert(workerd.parseUrl("../next?ok", "https://example.com/a/b/"))
+        local invalid, reason = workerd.parseUrl("relative")
+        local invalidBase, baseReason = workerd.parseUrl("../", "relative")
+        local body = table.concat({
+          absolute.href,
+          absolute.scheme,
+          absolute.host,
+          table.concat(absolute.path, "/"),
+          tostring(absolute.hasTrailingSlash),
+          tostring(#absolute.query),
+          absolute.query[1].name .. "=" .. absolute.query[1].value,
+          absolute.query[2].name .. "=" .. absolute.query[2].value,
+          absolute.query[3].name .. "=" .. tostring(absolute.query[3].value),
+          absolute.fragment,
+          absolute.username,
+          absolute.password,
+          relative.href,
+          tostring(invalid == nil),
+          tostring(type(reason) == "string"),
+          tostring(invalidBase == nil),
+          tostring(type(baseReason) == "string"),
+        }, "|")
+        return { status = 200, body = body }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/url"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) ==
+      "https://user:pass@example.com:8443/a%20b/b/?x=1&x=two&flag#frag|https|example.com:8443|a b/b|true|3|x=1|x=two|flag=nil|frag|user|pass|https://example.com/a/next?ok|true|true|true|true");
+}
+
 KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(
