@@ -26,10 +26,12 @@ struct LuaBinding {
     TEXT,
     DATA,
     JSON,
+    SERVICE,
   };
 
   kj::String name;
   Type type;
+  size_t serviceBindingIndex = 0;
   kj::String text;
   kj::Array<kj::byte> data;
 };
@@ -56,6 +58,7 @@ struct LuaHttpRequest {
   kj::Maybe<kj::String> bodyStreamRequestId;
   // When present, the host pulls chunks from this Lua-produced source as backpressure allows.
   kj::Maybe<kj::Own<LuaRequestBodyProducer>> bodyProducer;
+  kj::Maybe<size_t> serviceBindingIndex;
 };
 
 struct LuaHttpResponse {

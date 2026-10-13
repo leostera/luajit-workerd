@@ -928,6 +928,34 @@ KJ_TEST("Server: LuaJIT fetch uses a custom global outbound service") {
       R"(HTTP/1\.1 201 LuaJIT[\s\S]*Content-Length: 13[\s\S]*Content-Type: text/plain[\s\S]*from upstream)");
 }
 
+KJ_TEST("Server: LuaJIT service bindings route fetches to the configured worker") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local response = workerd.bindings.TARGET.fetch({ url = 'http://target/from-service' }); return { status = response.status, body = workerd.readAll(response.body) } end }",
+          globalOutbound = "custom",
+          bindings = [(name = "TARGET", service = "target")]
+        )
+      ),
+      ( name = "target",
+        worker = (
+          luaScript = "return { fetch = function(request) return { status = 203, body = 'target:' .. request.url } end }"
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/invoke");
+  conn.recvRegex(R"(HTTP/1\.1 203 LuaJIT[\s\S]*target:http://target/from-service)");
+}
+
 KJ_TEST("Server: LuaJIT streams Lua-produced outbound body chunks") {
   TestServer test(R"((
     services = [
@@ -1217,7 +1245,7 @@ KJ_TEST("Server: LuaJIT rejects duplicate binding names") {
 KJ_TEST("Server: LuaJIT worker rejects unsupported bindings") {
   TestServer test(singleWorker(R"((
     luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
-    bindings = [(name = "ignored", service = "target")]
+    bindings = [(name = "ignored", unsafeEval = void)]
   ))"_kj));
 
   test.server.allowExperimental();

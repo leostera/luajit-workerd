@@ -1011,6 +1011,50 @@ KJ_TEST("LuaJIT outbound fetch propagates request trace context") {
   KJ_EXPECT(observation->operationNames[1] == "lua.fetch");
 }
 
+KJ_TEST("LuaJIT service-binding requests preserve subrequest accounting") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded = pcall(function()
+          workerd.bindings.TARGET.fetch({ url = "https://target/path" })
+        end)
+        return { status = 200, body = tostring(succeeded) }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("TARGET"),
+    .type = LuaBinding::Type::SERVICE,
+    .serviceBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  auto serviceChannel = kj::refcounted<RecordingSubrequestChannel>();
+  auto* serviceChannelPtr = serviceChannel.get();
+  kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> serviceChannels;
+  serviceChannels.add(kj::addRef(*serviceChannel));
+  auto accounting = kj::rc<SubrequestAccountingState>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {}, testEntropySource(),
+      kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
+      kj::refcounted<RecordingRequestObserver>(accounting.addRef()), serviceChannels.asPtr());
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "false");
+  KJ_EXPECT(outbound->requestsStarted == 0);
+  KJ_EXPECT(serviceChannelPtr->requestsStarted == 1);
+  KJ_EXPECT(accounting->admissionCalls == 1);
+  KJ_EXPECT(accounting->lastType == SubrequestType::EXTERNAL);
+  KJ_EXPECT(accounting->observerCalls == 1);
+  KJ_EXPECT(accounting->lastCount == CountSubrequest::YES);
+}
+
 KJ_TEST("LuaJIT request scope rejects subrequests before routing or observation") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(
@@ -1299,6 +1343,42 @@ KJ_TEST("LuaJIT computes bounded binary-safe HMAC values") {
       "d7f4727e2c0b39ae0f1e40cc96f60242d5b7801841cea6fc592c5d3e1ae50700582a96cf35e1e554995fe4e03381c237:"
       "b42af09057bac1e2d41708e48a902e09b5ff7f12ab428a4fe86653c73dd248fb82f948a549f7b791a5b41915ee4d1ec3935357e4e2317250d0372afa2ebeeb3a:"
       "20b3a393e9f0e606ae91954f1f871ebd5cd9c3a8f26e7b22beaed26ab4891891:true:true:true:true:true:true:true:true:true");
+}
+
+KJ_TEST("LuaJIT service binding fetches select their configured channel") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local response = workerd.bindings.TARGET.fetch({ url = "https://target/path" })
+        return { status = 200, body = tostring(response.status) .. ":" .. workerd.readAll(response.body) }
+      end,
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("TARGET"),
+    .type = LuaBinding::Type::SERVICE,
+    .serviceBindingIndex = 1,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, hostOperations.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "202:upstream");
+  KJ_IF_SOME(request, hostOperations.lastRequest) {
+    KJ_IF_SOME(index, request.serviceBindingIndex) {
+      KJ_EXPECT(index == 1);
+    } else {
+      KJ_FAIL_ASSERT("service binding fetch should carry its configured channel index");
+    }
+  } else {
+    KJ_FAIL_ASSERT("service binding fetch should reach the host");
+  }
 }
 
 KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings") {

@@ -2067,18 +2067,25 @@ class Server::InvalidConfigService final: public Service {
   }
 };
 
+struct LuaServiceBindingConfig {
+  config::ServiceDesignator::Reader designator;
+  kj::String name;
+};
+
 class Server::LuaWorkerService final: public Service {
  public:
   LuaWorkerService(Server& server,
       kj::StringPtr name,
       kj::StringPtr source,
       kj::Array<::workerd::rt::luajit::LuaBinding> bindings,
+      kj::Array<LuaServiceBindingConfig> serviceBindingConfigs,
       config::ServiceDesignator::Reader globalOutbound,
       const kj::HttpHeaderTable& headerTable,
       kj::Timer& timer,
       ::workerd::rt::luajit::LuaRequestBodyMode requestBodyMode)
       : server(server),
         name(kj::str(name)),
+        serviceBindingConfigs(kj::mv(serviceBindingConfigs)),
         globalOutbound(globalOutbound),
         headerTable(headerTable),
         runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer, kj::mv(bindings))),
@@ -2087,9 +2094,14 @@ class Server::LuaWorkerService final: public Service {
   void link(Worker::ValidationErrorReporter&) override {
     outbound = server.lookupService(
         globalOutbound, kj::str("LuaJIT worker \"", name, "\"'s globalOutbound"));
+    for (auto& binding: serviceBindingConfigs) {
+      serviceBindings.add(server.lookupService(binding.designator,
+          kj::str("LuaJIT worker \"", name, "\"'s service binding \"", binding.name, "\"")));
+    }
   }
 
   void unlink() override {
+    serviceBindings.clear();
     outbound = nullptr;
   }
 
@@ -2097,7 +2109,7 @@ class Server::LuaWorkerService final: public Service {
     KJ_REQUIRE(outbound.get() != nullptr, "LuaJIT worker has not been linked", name);
     return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(*runtime, *outbound, headerTable,
         kj::mv(metadata), server.entropySource, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
-        kj::refcounted<RequestObserver>(), requestBodyMode);
+        kj::refcounted<RequestObserver>(), requestBodyMode, serviceBindings.asPtr());
   }
 
   bool hasHandler(kj::StringPtr handlerName) override {
@@ -2116,9 +2128,11 @@ class Server::LuaWorkerService final: public Service {
  private:
   Server& server;
   kj::String name;
+  kj::Array<LuaServiceBindingConfig> serviceBindingConfigs;
   config::ServiceDesignator::Reader globalOutbound;
   const kj::HttpHeaderTable& headerTable;
   kj::Own<Service> outbound;
+  kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings;
   kj::Own<::workerd::rt::luajit::LuaRuntime> runtime;
   ::workerd::rt::luajit::LuaRequestBodyMode requestBodyMode;
 };
@@ -5831,6 +5845,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     }
     kj::HashSet<kj::String> bindingNames;
     kj::Vector<::workerd::rt::luajit::LuaBinding> luaBindings;
+    kj::Vector<LuaServiceBindingConfig> luaServiceBindingConfigs;
     for (auto binding: conf.getBindings()) {
       auto bindingName = kj::str(binding.getName());
       if (bindingName.size() == 0) {
@@ -5869,6 +5884,18 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
             .text = kj::str(binding.getJson()),
           });
           break;
+        case config::Worker::Binding::SERVICE: {
+          luaBindings.add(LuaBinding{
+            .name = kj::str(bindingName),
+            .type = LuaBinding::Type::SERVICE,
+            .serviceBindingIndex = luaServiceBindingConfigs.size(),
+          });
+          luaServiceBindingConfigs.add(LuaServiceBindingConfig{
+            .designator = binding.getService(),
+            .name = kj::str(bindingName),
+          });
+          break;
+        }
         default:
           unsupportedConfig = true;
           errorReporter.addError(kj::str("LuaJIT worker \"", name, "\" does not support binding \"",
@@ -5895,7 +5922,8 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     kj::Maybe<kj::Own<Service>> luaService = kj::none;
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
       luaService = kj::refcounted<LuaWorkerService>(*this, name, conf.getLuaScript(),
-          luaBindings.releaseAsArray(), conf.getGlobalOutbound(), globalContext->headerTable, timer,
+          luaBindings.releaseAsArray(), luaServiceBindingConfigs.releaseAsArray(),
+          conf.getGlobalOutbound(), globalContext->headerTable, timer,
           conf.getLuaRequestBodyStreaming() ? ::workerd::rt::luajit::LuaRequestBodyMode::STREAMING
                                             : ::workerd::rt::luajit::LuaRequestBodyMode::BUFFERED);
     })) {

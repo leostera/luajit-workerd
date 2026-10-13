@@ -24,7 +24,8 @@ class LuaIoContext final: public LuaHostOperations {
       IoChannelFactory::SubrequestMetadata metadata,
       kj::EntropySource& entropySource,
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-      kj::Own<workerd::RequestObserver> observer);
+      kj::Own<workerd::RequestObserver> observer,
+      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr);
   ~LuaIoContext() noexcept(false) override;
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
@@ -44,6 +45,7 @@ class LuaIoContext final: public LuaHostOperations {
   kj::Own<workerd::RequestObserver> observer;
   RequestScope requestScope;
   IoChannelFactory::SubrequestChannel& outbound;
+  kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings;
   const kj::HttpHeaderTable& headerTable;
   kj::EntropySource& entropySource;
   kj::Maybe<kj::String> cfBlobJson;
@@ -62,7 +64,8 @@ class LuaWorkerInterface final: public WorkerInterface {
       kj::EntropySource& entropySource,
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
       kj::Own<workerd::RequestObserver> observer,
-      LuaRequestBodyMode requestBodyMode);
+      LuaRequestBodyMode requestBodyMode,
+      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,

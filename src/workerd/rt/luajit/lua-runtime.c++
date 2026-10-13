@@ -54,6 +54,21 @@ function workerd.randomUUID()
   return workerd.await({ operation = "randomUUID" })
 end
 
+function workerd.createServiceBinding(serviceBindingIndex)
+  return {
+    fetch = function(request)
+      if type(request) ~= "table" then
+        error("service binding fetch() requires a request table", 2)
+      end
+      return workerd.await({
+        operation = "fetch",
+        serviceBindingIndex = serviceBindingIndex,
+        request = request,
+      })
+    end,
+  }
+end
+
 function workerd.fetch(request)
   if type(request) ~= "table" then
     error("workerd.fetch() requires a request table", 2)
@@ -549,10 +564,23 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<const LuaBinding> bindings) 
         }
         break;
       }
+      case LuaBinding::Type::SERVICE: {
+        getRawField(state, -3, "createServiceBinding");
+        KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT service binding factory is unavailable");
+        KJ_REQUIRE(binding.serviceBindingIndex < static_cast<size_t>(INT_MAX),
+            "too many Lua service bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(binding.serviceBindingIndex + 1));
+        int status = lua_pcall(state, 1, 1, 0);
+        KJ_REQUIRE(
+            status == 0, "failed to create Lua service binding:", readLuaErrorMessage(state));
+        break;
+      }
     }
     lua_rawset(state, -3);
   }
   lua_setfield(state, -2, "bindings");
+  lua_pushnil(state);
+  lua_setfield(state, -2, "createServiceBinding");
   lua_pop(state, 1);
 }
 
@@ -678,7 +706,25 @@ class LuaFunctionRequestBodyProducer final: public LuaRequestBodyProducer {
   bool reachedEof = false;
 };
 
-LuaHttpRequest readFetchRequest(lua_State* state, int tableIndex) {
+kj::Maybe<size_t> readOptionalServiceBindingIndex(lua_State* state, int descriptorIndex) {
+  descriptorIndex = absoluteIndex(state, descriptorIndex);
+  getRawField(state, descriptorIndex, "serviceBindingIndex");
+  if (lua_isnil(state, -1)) {
+    lua_pop(state, 1);
+    return kj::none;
+  }
+
+  int isNumber = 0;
+  lua_Integer index = lua_tointegerx(state, -1, &isNumber);
+  bool validIndex = lua_type(state, -1) == LUA_TNUMBER && isNumber && index >= 1 &&
+      index <= INT_MAX && static_cast<lua_Number>(index) == lua_tonumber(state, -1);
+  lua_pop(state, 1);
+  KJ_REQUIRE(validIndex, "service binding index must be a positive integer");
+  return static_cast<size_t>(index - 1);
+}
+
+LuaHttpRequest readFetchRequest(
+    lua_State* state, int tableIndex, kj::Maybe<size_t> serviceBindingIndex = kj::none) {
   tableIndex = absoluteIndex(state, tableIndex);
   KJ_REQUIRE(lua_istable(state, tableIndex), "workerd.fetch() request must be a table");
 
@@ -731,6 +777,7 @@ LuaHttpRequest readFetchRequest(lua_State* state, int tableIndex) {
     .body = kj::mv(body),
     .bodyStreamRequestId = kj::mv(bodyStreamRequestId),
     .bodyProducer = kj::mv(bodyProducer),
+    .serviceBindingIndex = kj::mv(serviceBindingIndex),
   };
 }
 
@@ -815,8 +862,10 @@ readHostOperation(lua_State* state) {
     return LuaRandomBytesRequest{.size = static_cast<size_t>(size)};
   }
   if (name == "fetch") {
-    getRawField(state, -1, "request");
-    auto request = readFetchRequest(state, -1);
+    int descriptorIndex = absoluteIndex(state, -1);
+    auto serviceBindingIndex = readOptionalServiceBindingIndex(state, descriptorIndex);
+    getRawField(state, descriptorIndex, "request");
+    auto request = readFetchRequest(state, -1, kj::mv(serviceBindingIndex));
     lua_pop(state, 1);
     return kj::mv(request);
   }
@@ -1146,11 +1195,13 @@ LuaIoContext::LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
     IoChannelFactory::SubrequestMetadata metadata,
     kj::EntropySource& entropySource,
     kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-    kj::Own<workerd::RequestObserver> observer)
+    kj::Own<workerd::RequestObserver> observer,
+    kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings)
     : subrequestLimitPolicy(kj::mv(subrequestLimitPolicy)),
       observer(kj::mv(observer)),
       requestScope(*this->subrequestLimitPolicy, *this->observer),
       outbound(outbound),
+      serviceBindings(serviceBindings),
       headerTable(headerTable),
       entropySource(entropySource),
       cfBlobJson(kj::mv(metadata.cfBlobJson)),
@@ -1245,11 +1296,19 @@ kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {
     KJ_IF_SOME(id, headerTable.stringToId("transfer-encoding")) headers.unset(id);
   }
 
+  KJ_IF_SOME(index, request.serviceBindingIndex) {
+    KJ_REQUIRE(index < serviceBindings.size(), "unknown Lua service binding index", index);
+  }
   requestScope.checkSubrequest(SubrequestType::EXTERNAL);
   auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
                      .newChild(kj::ConstString(kj::str("lua.fetch")));
-  auto subrequest = requestScope.wrapSubrequestClient(
-      outbound.startRequest(makeSubrequestMetadata(tracing)), CountSubrequest::YES);
+  auto startRequest = [&]() {
+    KJ_IF_SOME(index, request.serviceBindingIndex) {
+      return serviceBindings[index]->startRequest(makeSubrequestMetadata(tracing));
+    }
+    return outbound.startRequest(makeSubrequestMetadata(tracing));
+  };
+  auto subrequest = requestScope.wrapSubrequestClient(startRequest(), CountSubrequest::YES);
   auto client = asHttpClient(kj::mv(subrequest));
   kj::Maybe<uint64_t> expectedBodySize = kj::none;
   if (!hasStreamingBody) expectedBodySize = request.body.size();
@@ -1302,14 +1361,16 @@ LuaWorkerInterface::LuaWorkerInterface(LuaRuntime& runtime,
     kj::EntropySource& entropySource,
     kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
     kj::Own<workerd::RequestObserver> observer,
-    LuaRequestBodyMode requestBodyMode)
+    LuaRequestBodyMode requestBodyMode,
+    kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings)
     : runtime(runtime),
       hostOperations(outbound,
           headerTable,
           kj::mv(metadata),
           entropySource,
           kj::mv(subrequestLimitPolicy),
-          kj::mv(observer)),
+          kj::mv(observer),
+          serviceBindings),
       requestBodyMode(requestBodyMode) {}
 
 kj::Promise<void> LuaWorkerInterface::request(kj::HttpMethod method,
