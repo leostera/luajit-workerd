@@ -332,6 +332,66 @@ kj::String readRequestBodyStreamId(lua_State* state, int tableIndex) {
   return readBodyRequestId(state, tableIndex);
 }
 
+class LuaFunctionRequestBodyProducer final: public LuaRequestBodyProducer {
+ public:
+  LuaFunctionRequestBodyProducer(lua_State* state, int functionRef)
+      : functionRef(functionRef),
+        producerCoroutine(lua_newthread(state)),
+        coroutineRef(luaL_ref(state, LUA_REGISTRYINDEX)) {}
+
+  ~LuaFunctionRequestBodyProducer() noexcept(false) override {
+    luaL_unref(producerCoroutine, LUA_REGISTRYINDEX, functionRef);
+    luaL_unref(producerCoroutine, LUA_REGISTRYINDEX, coroutineRef);
+  }
+
+  kj::Promise<kj::Maybe<kj::Array<kj::byte>>> nextChunk() override {
+    if (reachedEof) return kj::Maybe<kj::Array<kj::byte>>(kj::none);
+    lua_settop(producerCoroutine, 0);
+    lua_rawgeti(producerCoroutine, LUA_REGISTRYINDEX, functionRef);
+    auto status = lua_pcall(producerCoroutine, 0, 1, 0);
+    if (status != 0) {
+      auto message = readLuaErrorMessage(producerCoroutine);
+      lua_settop(producerCoroutine, 0);
+      KJ_FAIL_REQUIRE("LuaJIT request body producer failed:", message);
+    }
+
+    if (lua_isnil(producerCoroutine, -1)) {
+      reachedEof = true;
+      lua_settop(producerCoroutine, 0);
+      return kj::Maybe<kj::Array<kj::byte>>(kj::none);
+    }
+    if (lua_type(producerCoroutine, -1) != LUA_TSTRING) {
+      lua_settop(producerCoroutine, 0);
+      KJ_FAIL_REQUIRE("LuaJIT request body producer must return a string or nil");
+    }
+
+    size_t length = 0;
+    const char* bytes = lua_tolstring(producerCoroutine, -1, &length);
+    if (length > LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES) {
+      lua_settop(producerCoroutine, 0);
+      KJ_FAIL_REQUIRE("LuaJIT request body producer chunk exceeds limit",
+          LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES);
+    }
+    if (length > LuaRuntime::MAX_HTTP_BODY_BYTES - bytesGenerated) {
+      lua_settop(producerCoroutine, 0);
+      KJ_FAIL_REQUIRE("LuaJIT request body producer exceeds total upload limit",
+          LuaRuntime::MAX_HTTP_BODY_BYTES);
+    }
+    bytesGenerated += length;
+    auto result = kj::heapArray<kj::byte>(length);
+    if (length > 0) std::memcpy(result.begin(), bytes, length);
+    lua_settop(producerCoroutine, 0);
+    return kj::Maybe<kj::Array<kj::byte>>(kj::mv(result));
+  }
+
+ private:
+  int functionRef;
+  lua_State* producerCoroutine;
+  int coroutineRef;
+  size_t bytesGenerated = 0;
+  bool reachedEof = false;
+};
+
 LuaHttpRequest readFetchRequest(lua_State* state, int tableIndex) {
   tableIndex = absoluteIndex(state, tableIndex);
   KJ_REQUIRE(lua_istable(state, tableIndex), "workerd.fetch() request must be a table");
@@ -353,6 +413,7 @@ LuaHttpRequest readFetchRequest(lua_State* state, int tableIndex) {
 
   kj::Array<kj::byte> body = kj::heapArray<kj::byte>(0);
   kj::Maybe<kj::String> bodyStreamRequestId = kj::none;
+  kj::Maybe<kj::Own<LuaRequestBodyProducer>> bodyProducer = kj::none;
   getRawField(state, tableIndex, "body");
   if (!lua_isnil(state, -1)) {
     if (lua_type(state, -1) == LUA_TSTRING) {
@@ -364,8 +425,13 @@ LuaHttpRequest readFetchRequest(lua_State* state, int tableIndex) {
       if (length > 0) std::memcpy(body.begin(), bytes, length);
     } else if (lua_istable(state, -1)) {
       bodyStreamRequestId = readRequestBodyStreamId(state, absoluteIndex(state, -1));
+    } else if (lua_isfunction(state, -1)) {
+      lua_pushvalue(state, -1);
+      int functionRef = luaL_ref(state, LUA_REGISTRYINDEX);
+      bodyProducer = kj::heap<LuaFunctionRequestBodyProducer>(state, functionRef);
     } else {
-      KJ_FAIL_REQUIRE("workerd.fetch() request body must be a string, request body stream, or nil");
+      KJ_FAIL_REQUIRE(
+          "workerd.fetch() request body must be a string, request body stream, producer function, or nil");
     }
   }
   lua_pop(state, 1);
@@ -378,6 +444,7 @@ LuaHttpRequest readFetchRequest(lua_State* state, int tableIndex) {
     .headers = kj::mv(headers),
     .body = kj::mv(body),
     .bodyStreamRequestId = kj::mv(bodyStreamRequestId),
+    .bodyProducer = kj::mv(bodyProducer),
   };
 }
 
@@ -797,11 +864,17 @@ kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {
   } else {
     KJ_FAIL_REQUIRE("workerd.fetch() has an unsupported HTTP method", request.method);
   }
-  bool hasStreamingBody = request.bodyStreamRequestId != kj::none;
+  bool hasInboundBodyStream = request.bodyStreamRequestId != kj::none;
+  bool hasBodyProducer = request.bodyProducer != kj::none;
+  bool hasStreamingBody = hasInboundBodyStream || hasBodyProducer;
+  KJ_REQUIRE(!(hasInboundBodyStream && hasBodyProducer),
+      "workerd.fetch() request cannot have multiple streaming body sources");
+  KJ_REQUIRE(!hasStreamingBody || request.body.size() == 0,
+      "workerd.fetch() request cannot combine a string body with a streaming body source");
   KJ_REQUIRE((method != kj::HttpMethod::GET && method != kj::HttpMethod::HEAD) ||
           (request.body.size() == 0 && !hasStreamingBody),
       "workerd.fetch() GET and HEAD requests cannot have a body");
-  KJ_REQUIRE(!hasStreamingBody || requestBodyStream != kj::none,
+  KJ_REQUIRE(!hasInboundBodyStream || requestBodyStream != kj::none,
       "workerd.fetch() request body stream is unavailable in this request");
 
   kj::HttpHeaders headers(headerTable);
@@ -823,9 +896,21 @@ kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {
   if (!hasStreamingBody) expectedBodySize = request.body.size();
   auto outgoing = client->request(method, request.url, headers, expectedBodySize);
   if (outgoing.body.get() != nullptr) {
-    if (hasStreamingBody) {
+    if (hasInboundBodyStream) {
       while (true) {
         KJ_IF_SOME(chunk, co_await readRequestBody(LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES)) {
+          co_await outgoing.body->write(chunk);
+        } else {
+          break;
+        }
+      }
+    } else KJ_IF_SOME(producer, request.bodyProducer) {
+      size_t bytesWritten = 0;
+      while (true) {
+        KJ_IF_SOME(chunk, co_await producer->nextChunk()) {
+          KJ_REQUIRE(chunk.size() <= LuaRuntime::MAX_HTTP_BODY_BYTES - bytesWritten,
+              "workerd.fetch() request body exceeds limit", LuaRuntime::MAX_HTTP_BODY_BYTES);
+          bytesWritten += chunk.size();
           co_await outgoing.body->write(chunk);
         } else {
           break;

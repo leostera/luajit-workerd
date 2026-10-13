@@ -928,6 +928,32 @@ KJ_TEST("Server: LuaJIT fetch uses a custom global outbound service") {
       R"(HTTP/1\.1 201 LuaJIT[\s\S]*Content-Length: 13[\s\S]*Content-Type: text/plain[\s\S]*from upstream)");
 }
 
+KJ_TEST("Server: LuaJIT streams Lua-produced outbound body chunks") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local index=0; local function nextChunk() index=index+1; if index==1 then return 'abc' end; if index==2 then return 'def' end; return nil end; local x=workerd.fetch({method='POST', url='https://example.com/generated', body=nextChunk}); return {status=x.status, body=workerd.readAll(x.body)} end }",
+          globalOutbound = "custom"
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/generated");
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(
+      R"(POST https://example\.com/generated HTTP/1\.1\nTransfer-Encoding: chunked\n\n3\nabc\n3\ndef\n0\n\n)");
+  subrequest.send("HTTP/1.1 201 Created\nContent-Length: 2\n\nOK");
+  conn.recvRegex(R"(HTTP/1\.1 201 LuaJIT[\s\S]*OK)");
+}
+
 KJ_TEST("Server: LuaJIT streams request bodies through outbound fetch") {
   TestServer test(R"((
     services = [

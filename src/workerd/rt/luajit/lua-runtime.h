@@ -39,6 +39,14 @@ struct LuaHttpHeader {
   kj::String value;
 };
 
+class LuaRequestBodyProducer {
+ public:
+  virtual ~LuaRequestBodyProducer() noexcept(false) = default;
+  // The producer is tied to its LuaRuntime; hosts must consume or destroy it before fetch completes.
+  // Return one chunk or none at EOF; hosts request the next chunk after accepting the previous one.
+  virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> nextChunk() = 0;
+};
+
 struct LuaHttpRequest {
   kj::String method;
   kj::String url;
@@ -46,6 +54,8 @@ struct LuaHttpRequest {
   kj::Array<kj::byte> body;
   // When present, body bytes come from this request's inbound body stream.
   kj::Maybe<kj::String> bodyStreamRequestId;
+  // When present, the host pulls chunks from this Lua-produced source as backpressure allows.
+  kj::Maybe<kj::Own<LuaRequestBodyProducer>> bodyProducer;
 };
 
 struct LuaHttpResponse {
