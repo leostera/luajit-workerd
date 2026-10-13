@@ -3,7 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "lua-runtime.h"
-#include "lua-worker-interface.h"
+
+#include <workerd/util/stream-utils.h>
 
 #include <kj/async-io.h>
 #include <kj/test.h>
@@ -13,8 +14,295 @@
 namespace workerd::rt::luajit {
 namespace {
 
-kj::StringPtr asString(kj::ArrayPtr<const kj::byte> bytes) {
-  return kj::StringPtr(reinterpret_cast<const char*>(bytes.begin()), bytes.size());
+kj::String asString(kj::ArrayPtr<const kj::byte> bytes) {
+  return kj::heapString(reinterpret_cast<const char*>(bytes.begin()), bytes.size());
+}
+
+class TestLuaHostOperations final: public LuaHostOperations {
+ public:
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    lastRequest = kj::mv(request);
+    auto body = newMemoryInputStream("upstream"_kj);
+    kj::Vector<LuaHttpHeader> headers;
+    headers.add(LuaHttpHeader{.name = kj::str("x-upstream"), .value = kj::str("yes")});
+    co_return LuaHttpResponse{
+      .status = 202,
+      .headers = kj::mv(headers),
+      .body = kj::mv(body),
+    };
+  }
+
+  kj::Maybe<LuaHttpRequest> lastRequest;
+};
+
+class CancelableLuaHostOperations final: public LuaHostOperations {
+ public:
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    auto pair = kj::newPromiseAndFulfiller<LuaHttpResponse>();
+    fulfiller = kj::mv(pair.fulfiller);
+    return kj::mv(pair.promise).attach(kj::defer([this] { canceled = true; }));
+  }
+
+  kj::Own<kj::PromiseFulfiller<LuaHttpResponse>> fulfiller;
+  bool canceled = false;
+};
+
+class FailingLuaHostOperations final: public LuaHostOperations {
+ public:
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    KJ_FAIL_REQUIRE("mock outbound failure");
+  }
+};
+
+class InterleavingLuaHostOperations final: public LuaHostOperations {
+ public:
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    auto pair = kj::newPromiseAndFulfiller<LuaHttpResponse>();
+    pending.add(kj::mv(pair.fulfiller));
+    return kj::mv(pair.promise);
+  }
+
+  void complete(size_t index, kj::StringPtr bodyText) {
+    pending[index]->fulfill(LuaHttpResponse{
+      .status = 200,
+      .headers = {},
+      .body = newMemoryInputStream(bodyText),
+    });
+    pending[index] = nullptr;
+  }
+
+  kj::Vector<kj::Own<kj::PromiseFulfiller<LuaHttpResponse>>> pending;
+};
+
+KJ_TEST("LuaJIT outbound fetch uses runtime-neutral host operations") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        local response = workerd.fetch({
+          method = "POST",
+          url = "https://example.com/upstream",
+          headers = {{ name = "x-request", value = "yes" }},
+          body = request.body,
+        })
+        return {
+          status = response.status,
+          headers = response.headers,
+          body = workerd.readAll(response.body),
+        }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  TestLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto requestBody = kj::heapArray<kj::byte>(7);
+  std::memcpy(requestBody.begin(), "request", 7);
+
+  auto response = runtime.fetch("GET"_kj, "/"_kj, headers, requestBody, hostOperations.getPtr())
+                      .wait(io.waitScope);
+
+  KJ_EXPECT(response.status == 202);
+  KJ_EXPECT(asString(response.body) == "upstream");
+  KJ_REQUIRE(response.headers.size() == 1);
+  KJ_EXPECT(response.headers[0].name == "x-upstream");
+  KJ_EXPECT(response.headers[0].value == "yes");
+
+  KJ_IF_SOME(request, hostOperations.lastRequest) {
+    KJ_EXPECT(request.method == "POST");
+    KJ_EXPECT(request.url == "https://example.com/upstream");
+    KJ_EXPECT(asString(request.body) == "request");
+    KJ_REQUIRE(request.headers.size() == 1);
+    KJ_EXPECT(request.headers[0].name == "x-request");
+    KJ_EXPECT(request.headers[0].value == "yes");
+  } else {
+    KJ_FAIL_ASSERT("host fetch was not called");
+  }
+}
+
+KJ_TEST("LuaJIT cancels a suspended outbound operation with its request") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        workerd.fetch({ url = "https://example.com/pending" })
+        return { status = 200, body = "unexpected" }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  CancelableLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto request = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, hostOperations.getPtr());
+
+  KJ_EXPECT(!request.poll(io.waitScope));
+  request = nullptr;
+  KJ_EXPECT(hostOperations.canceled);
+}
+
+KJ_TEST("LuaJIT outbound fetch failures become catchable Lua errors") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded, message = pcall(function()
+          workerd.fetch({ url = "https://example.com/failure" })
+        end)
+        return { status = 200, body = tostring(succeeded) .. ":" .. message }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  FailingLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, hostOperations.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body).startsWith("false:"));
+  KJ_EXPECT(asString(response.body).contains("mock outbound failure"));
+}
+
+KJ_TEST("LuaJIT malformed outbound fetch input becomes a catchable Lua error") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded, message = pcall(function()
+          workerd.fetch({ url = 7 })
+        end)
+        return { status = 200, body = tostring(succeeded) .. ":" .. message }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
+
+  auto bodyText = asString(response.body);
+  KJ_EXPECT(bodyText.startsWith("false:"));
+}
+
+KJ_TEST("LuaJIT response-body reads reject invalid handles and chunk sizes") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local validHandle = pcall(workerd.readBody, "not a stream")
+        local validChunk = pcall(workerd.readBody, { streamId = 1 }, 65537)
+        local validCancel = pcall(workerd.cancelBody, "not a stream")
+        return {
+          status = 200,
+          body = tostring(validHandle) .. ":" .. tostring(validChunk) .. ":" .. tostring(validCancel),
+        }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) == "false:false:false");
+}
+
+KJ_TEST("LuaJIT response body handles cannot cross request boundaries") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    local savedBody
+    return {
+      fetch = function(request)
+        if request.url == "/first" then
+          savedBody = workerd.fetch({ url = "https://example.com/first" }).body
+          return { status = 200, body = "stored" }
+        end
+        local response = workerd.fetch({ url = "https://example.com/second" })
+        local succeeded = pcall(workerd.readBody, savedBody, 1)
+        workerd.cancelBody(response.body)
+        return { status = 200, body = tostring(succeeded) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  TestLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto first = runtime.fetch("GET"_kj, "/first"_kj, headers, nullptr, hostOperations.getPtr())
+                   .wait(io.waitScope);
+  auto second = runtime.fetch("GET"_kj, "/second"_kj, headers, nullptr, hostOperations.getPtr())
+                    .wait(io.waitScope);
+  KJ_EXPECT(asString(first.body) == "stored");
+  KJ_EXPECT(asString(second.body) == "false");
+}
+
+KJ_TEST("LuaJIT outbound fetch responses stay with their suspended request") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        local response = workerd.fetch({ url = "https://example.com/" .. request.url })
+        return { status = 200, body = workerd.readAll(response.body) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  InterleavingLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto first = runtime.fetch("GET"_kj, "/first"_kj, headers, nullptr, hostOperations.getPtr());
+  auto second = runtime.fetch("GET"_kj, "/second"_kj, headers, nullptr, hostOperations.getPtr());
+
+  KJ_REQUIRE(hostOperations.pending.size() == 2);
+  KJ_EXPECT(!first.poll(io.waitScope));
+  KJ_EXPECT(!second.poll(io.waitScope));
+
+  hostOperations.complete(1, "second response");
+  auto secondResult = second.wait(io.waitScope);
+  KJ_EXPECT(asString(secondResult.body) == "second response");
+  KJ_EXPECT(!first.poll(io.waitScope));
+
+  hostOperations.complete(0, "first response");
+  auto firstResult = first.wait(io.waitScope);
+  KJ_EXPECT(asString(firstResult.body) == "first response");
+}
+
+KJ_TEST("LuaJIT can issue multiple outbound fetches in one request") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local first = workerd.fetch({ url = "https://example.com/first" })
+        local second = workerd.fetch({ url = "https://example.com/second" })
+        return { status = 200,
+          body = workerd.readAll(first.body) .. ":" .. workerd.readAll(second.body) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  InterleavingLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto request = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, hostOperations.getPtr());
+
+  KJ_EXPECT(!request.poll(io.waitScope));
+  KJ_REQUIRE(hostOperations.pending.size() == 1);
+  hostOperations.complete(0, "first");
+  KJ_EXPECT(!request.poll(io.waitScope));
+  KJ_REQUIRE(hostOperations.pending.size() == 2);
+  hostOperations.complete(1, "second");
+  auto response = request.wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) == "first:second");
 }
 
 KJ_TEST("LuaJIT HTTP handler receives requests and returns status, headers, and body") {
@@ -108,19 +396,6 @@ KJ_TEST("LuaJIT coroutine-backed sleep yields without blocking other requests") 
 
   auto delayed = slow.wait(io.waitScope);
   KJ_EXPECT(asString(delayed.body) == "1:true");
-}
-
-KJ_TEST("LuaJIT HTTP interface rejects scheduled and alarm events") {
-  auto io = kj::setupAsyncIo();
-  LuaRuntime runtime(
-      R"lua(return { fetch = function() return { status = 200, body = "" } end })lua"_kj,
-      io.provider->getTimer());
-  LuaWorkerInterface worker(runtime);
-
-  KJ_EXPECT(kj::runCatchingExceptions(
-                [&]() { (void)worker.runScheduled(kj::UNIX_EPOCH, "* * * * *"_kj); }) != kj::none);
-  KJ_EXPECT(
-      kj::runCatchingExceptions([&]() { (void)worker.runAlarm(kj::UNIX_EPOCH, 0); }) != kj::none);
 }
 
 KJ_TEST("LuaJIT rejects invalid modules and handler results") {

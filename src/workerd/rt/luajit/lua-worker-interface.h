@@ -4,14 +4,18 @@
 
 #pragma once
 
+#include <workerd/io/io-channels.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/rt/luajit/lua-runtime.h>
 
 namespace workerd::rt::luajit {
 
-class LuaWorkerInterface final: public WorkerInterface {
+class LuaWorkerInterface final: public WorkerInterface, public LuaHostOperations {
  public:
-  explicit LuaWorkerInterface(LuaRuntime& runtime): runtime(runtime) {}
+  LuaWorkerInterface(LuaRuntime& runtime,
+      IoChannelFactory::SubrequestChannel& outbound,
+      const kj::HttpHeaderTable& headerTable,
+      IoChannelFactory::SubrequestMetadata metadata);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
@@ -27,9 +31,17 @@ class LuaWorkerInterface final: public WorkerInterface {
   kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override;
   kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override;
   kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override;
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
 
  private:
+  IoChannelFactory::SubrequestMetadata makeSubrequestMetadata(TraceContext& tracing);
+
   LuaRuntime& runtime;
+  IoChannelFactory::SubrequestChannel& outbound;
+  const kj::HttpHeaderTable& headerTable;
+  kj::Maybe<kj::String> cfBlobJson;
+  SpanParent parentSpan;
+  SpanParent userSpanParent;
 };
 
 }  // namespace workerd::rt::luajit

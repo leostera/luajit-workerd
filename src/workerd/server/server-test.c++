@@ -222,6 +222,10 @@ class TestStream {
     return *stream;
   }
 
+  void disconnect() {
+    stream = nullptr;
+  }
+
  private:
   kj::WaitScope& ws;
   kj::Own<kj::AsyncIoStream> stream;
@@ -827,6 +831,131 @@ KJ_TEST("Server: serve LuaJIT HTTP worker selected from config") {
             "Content-Type: text/plain;charset=UTF-8\n"
             "\n"
             "lua:http://foo/lua");
+}
+
+KJ_TEST("Server: LuaJIT fetch uses a custom global outbound service") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function(r) local x = workerd.fetch({method='POST', url='https://example.com/upstream', headers={{name='X-Lua', value='yes'}}, body=r.body}); return {status=x.status, headers=x.headers, body=workerd.readAll(x.body)} end }",
+          globalOutbound = "custom"
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send(R"(
+    POST /invoke HTTP/1.1
+    Host: foo
+    Content-Length: 8
+
+    from lua
+  )"_blockquote);
+
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(
+      R"(POST https://example\.com/upstream HTTP/1\.1[\s\S]*Content-Length: 8[\s\S]*X-Lua: yes[\s\S]*from lua)");
+  subrequest.send(R"(
+    HTTP/1.1 201 Created
+    Content-Length: 13
+    Content-Type: text/plain
+
+    from upstream
+  )"_blockquote);
+
+  conn.recvRegex(
+      R"(HTTP/1\.1 201 LuaJIT[\s\S]*Content-Length: 13[\s\S]*Content-Type: text/plain[\s\S]*from upstream)");
+}
+
+KJ_TEST("Server: LuaJIT fetch reads outbound response bodies incrementally") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local x = workerd.fetch({ url = 'https://example.com/stream' }); local chunk = workerd.readBody(x.body, 3); workerd.cancelBody(x.body); return { status = x.status, headers = {{ name = 'Content-Type', value = 'text/plain;charset=UTF-8' }}, body = chunk } end }",
+          globalOutbound = "custom"
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/stream");
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(R"(GET https://example\.com/stream HTTP/1\.1[\s\S]*)");
+  subrequest.send("HTTP/1.1 200 OK\nContent-Length: 6\n\nabc");
+
+  conn.recvRegex(
+      R"(HTTP/1\.1 200 LuaJIT[\s\S]*Content-Length: 3[\s\S]*Content-Type: text/plain;charset=UTF-8[\s\S]*abc)");
+  test.wait(1);
+  KJ_EXPECT(subrequest.isEof());
+}
+
+KJ_TEST("Server: LuaJIT cancels outbound fetch after the client disconnects") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local x = workerd.fetch({ url = 'https://example.com/pending' }); return { status=x.status, headers=x.headers, body=workerd.readAll(x.body) } end }",
+          globalOutbound = "custom"
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send("GET /pending HTTP/1.1\nHost: foo\n\n");
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(R"(GET https://example\.com/pending HTTP/1\.1[\s\S]*)");
+
+  conn.disconnect();
+  test.wait(1);
+  KJ_EXPECT(subrequest.isEof());
+}
+
+KJ_TEST("Server: LuaJIT cancels outbound body reads after the client disconnects") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local x = workerd.fetch({ url = 'https://example.com/slow' }); return { status=x.status, body=workerd.readAll(x.body) } end }",
+          globalOutbound = "custom"
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/slow");
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(R"(GET https://example\.com/slow HTTP/1\.1[\s\S]*)");
+  subrequest.send("HTTP/1.1 200 OK\nContent-Length: 6\n\nabc");
+
+  conn.disconnect();
+  test.wait(1);
+  KJ_EXPECT(subrequest.isEof());
 }
 
 KJ_TEST("Server: LuaJIT worker requires experimental mode") {

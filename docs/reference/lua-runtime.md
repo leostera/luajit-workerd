@@ -35,33 +35,40 @@ return {
 }
 ```
 
-A handler can call `workerd.sleep(milliseconds)` to suspend for a timer delay from 0 through 4,294,967,295 milliseconds. This yields the request coroutine without blocking the workerd event loop; no other asynchronous host operations are available yet.
+A handler can call `workerd.sleep(milliseconds)` to suspend for a timer delay from 0 through 4,294,967,295 milliseconds. It can also call `workerd.fetch(request)` to send an HTTP subrequest through the worker's configured `globalOutbound` service:
 
-The request table contains:
+```lua
+local response = workerd.fetch({
+  method = "POST", -- defaults to GET
+  url = "https://example.com/echo",
+  headers = {
+    { name = "content-type", value = "text/plain" },
+  },
+  body = "hello",
+})
+```
+
+The request body is a Lua string. The result has `status`, `headers` (an array of `{ name, value }` tables), and `body`, a response-body stream handle. `workerd.readBody(body[, maxBytes])` reads at most the requested number of bytes (default 16 KiB; valid range 1–64 KiB) and returns `nil` at EOF. `workerd.readAll(body)` reads to EOF and concatenates the chunks into one Lua string. `workerd.cancelBody(body)` closes an unread response stream and returns `true`; body handles are request-scoped, cannot be used by another request, and are automatically closed when the request completes. Both operations suspend the request coroutine while waiting for body data; a host-operation error is raised as a Lua error and can be caught with `pcall()`. GET and HEAD requests cannot include a body.
+
+The inbound request table contains:
 
 - `method`: the HTTP method string.
 - `url`: the request URL as passed to the workerd HTTP service (normally an absolute URL for a configured HTTP listener).
 - `headers`: an array of `{ name, value }` string tables. Repeated headers are represented by repeated array entries.
-- `body`: the request body as a Lua string.
+- `body`: the fully buffered request body as a Lua string.
 
-The response must be a table with an integer `status` from 200 through 599 and a string `body`. It may include `headers`, an array of `{ name, value }` string tables. Response header names and values are validated by workerd's HTTP header implementation. Handler exceptions, invalid module results, and invalid response fields fail the request; they are not converted into successful responses. The HTTP reason phrase is `LuaJIT` for every response; clients should use the numeric status code.
+The handler response must be a table with an integer `status` from 200 through 599 and a string `body`. It may include `headers`, an array of `{ name, value }` string tables. Response header names and values are validated by workerd's HTTP header implementation. Handler exceptions, invalid module results, and invalid response fields fail the request; they are not converted into successful responses. The HTTP reason phrase is `LuaJIT` for every response; clients should use the numeric status code.
 
-One LuaJIT state is owned by each configured Lua worker service. The module is evaluated once and Lua globals persist across that service's HTTP requests, but state is neither shared with another worker service nor persisted across process restarts. Each request runs in its own Lua coroutine. The current host async operation is `workerd.sleep(milliseconds)`, which suspends that request without blocking other requests; handlers can share and interleave access to Lua globals across such suspension points. Ordinary Lua code remains synchronous and runs on the workerd event-loop thread. Request and response bodies are limited to 1 MiB each, and each header list is limited to 128 entries.
+One LuaJIT state is owned by each configured Lua worker service. The module is evaluated once and Lua globals persist across that service's HTTP requests, but state is neither shared with another worker service nor persisted across process restarts. Each request runs in its own Lua coroutine. `workerd.sleep(milliseconds)`, `workerd.fetch(request)`, and `workerd.readBody()` suspend that request without blocking other requests; handlers can share and interleave access to Lua globals across such suspension points. Ordinary Lua code remains synchronous and runs on the workerd event-loop thread. Inbound request bodies, outbound request bodies, and handler response bodies are buffered and limited to 1 MiB each. `workerd.fetch()` response bodies are read incrementally, with each `workerd.readBody()` call limited to 64 KiB; `workerd.readAll()` can accumulate an unbounded Lua string. Each header list is limited to 128 entries. Streaming request bodies are not implemented.
 
 ## Supported scope and limitations
 
-The Lua backend does not implement JavaScript, Web APIs, Node.js APIs, or the JSG interface. Beyond `workerd.sleep(milliseconds)`, it has no asynchronous host APIs yet. It does not support worker bindings, custom outbound services, compatibility dates or flags, Durable Objects, Workflows, Cache API outbound bindings, module fallback, tail workers, containers, Access bindings, RPC, scheduled events, alarms, HTTP CONNECT, or WebSockets. Unsupported worker configuration is rejected during service construction; unsupported request/event methods fail explicitly.
+The Lua backend does not implement JavaScript, Web APIs, Node.js APIs, or the JSG interface. `workerd.fetch()` is an experimental HTTP adapter over the configured `globalOutbound` route. Response bodies support incremental reads and backpressure through `workerd.readBody()`, but inbound and outbound request bodies remain buffered. The adapter does not use the normal `IoContext` subrequest accounting/observer path, so it is not equivalent to JavaScript `fetch()`; a runtime-neutral host-context integration is still required. KJ promise cancellation is covered at the runtime boundary and by server tests that disconnect the inbound client while an outbound fetch or response-body read is pending.
+
+Worker bindings, compatibility dates or flags, Durable Objects, Workflows, Cache API bindings, module fallback, tail workers, containers, Access bindings, RPC, scheduled events, alarms, HTTP CONNECT, and WebSockets are not implemented. Unsupported worker configuration is rejected during service construction; unsupported request/event methods fail explicitly.
 
 LuaJIT is not a sandbox. The runtime opens Lua's standard libraries, including operating-system, filesystem, package-loading, and native-library facilities. Lua source must be trusted. There is no instruction, CPU-time, or memory limit; synchronous Lua code can block the request event loop, even though `workerd.sleep()` can yield while waiting for a timer. Do not use this backend for tenant-controlled or otherwise untrusted code.
 
 ## Tests
 
-The runtime unit test covers HTTP data conversion, coroutine suspension/resumption, independent states, invalid modules and handler results, and unsupported scheduled/alarm events. The server test exercises config selection and an HTTP request that suspends through `workerd.sleep()`, and includes the unchanged V8 service-worker path as a regression check:
-
-On macOS arm64 with Bazel 9.2.0, the workerd binary and both focused test targets built successfully; both test targets passed. This checkout's JVM trust store could not validate `https://bcr.bazel.build/`, so the commands below used the raw GitHub mirror of the Bazel Central Registry:
-
-```sh
-bazel build --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/server:workerd
-bazel test --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/rt/luajit:lua-runtime-test@
-bazel test --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main //src/workerd/server:server-test@
-```
+The runtime unit tests cover HTTP data conversion, host-operation request/response mapping, chunked response-body reads, request-local body-handle validation, cancellation of host operations and response streams, coroutine suspension/resumption, independent states, and invalid modules and handler results. Server tests cover config selection, custom `globalOutbound` routing, incremental response reads while the upstream body is still open, client disconnects during pending fetches and body reads, and an inbound request suspended through `workerd.sleep()`. They do not establish `IoContext` subrequest accounting/observer parity or streaming request-body support.

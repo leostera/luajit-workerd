@@ -10,6 +10,7 @@ wd_cc_library(
     ],
     visibility = ["//src/workerd/server:__pkg__"],
     deps = [
+        "//src/workerd/io:io",
         "//src/workerd/io:worker-interface",
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj/compat:kj-http",
@@ -19,5 +20,8 @@ wd_cc_library(
 
 kj_test(
     src = "lua-runtime-test.c++",
-    deps = [":luajit-runtime"],
+    deps = [
+        ":luajit-runtime",
+        "//src/workerd/util",
+    ],
 )

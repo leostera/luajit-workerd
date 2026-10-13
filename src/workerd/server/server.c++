@@ -2069,12 +2069,31 @@ class Server::InvalidConfigService final: public Service {
 
 class Server::LuaWorkerService final: public Service {
  public:
-  LuaWorkerService(kj::StringPtr name, kj::StringPtr source, kj::Timer& timer)
-      : name(kj::str(name)),
+  LuaWorkerService(Server& server,
+      kj::StringPtr name,
+      kj::StringPtr source,
+      config::ServiceDesignator::Reader globalOutbound,
+      const kj::HttpHeaderTable& headerTable,
+      kj::Timer& timer)
+      : server(server),
+        name(kj::str(name)),
+        globalOutbound(globalOutbound),
+        headerTable(headerTable),
         runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer)) {}
 
+  void link(Worker::ValidationErrorReporter&) override {
+    outbound = server.lookupService(
+        globalOutbound, kj::str("LuaJIT worker \"", name, "\"'s globalOutbound"));
+  }
+
+  void unlink() override {
+    outbound = nullptr;
+  }
+
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
-    return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(*runtime);
+    KJ_REQUIRE(outbound.get() != nullptr, "LuaJIT worker has not been linked", name);
+    return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(
+        *runtime, *outbound, headerTable, kj::mv(metadata));
   }
 
   bool hasHandler(kj::StringPtr handlerName) override {
@@ -2091,7 +2110,11 @@ class Server::LuaWorkerService final: public Service {
   }
 
  private:
+  Server& server;
   kj::String name;
+  config::ServiceDesignator::Reader globalOutbound;
+  const kj::HttpHeaderTable& headerTable;
+  kj::Own<Service> outbound;
   kj::Own<::workerd::rt::luajit::LuaRuntime> runtime;
 };
 
@@ -5798,10 +5821,6 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     rejectIf(conf.getBindings().size() != 0, "bindings");
     rejectIf(conf.hasCompatibilityDate() || conf.getCompatibilityFlags().size() != 0,
         "compatibility dates and flags");
-    auto outbound = conf.getGlobalOutbound();
-    rejectIf(outbound.getName() != "internet" || outbound.hasEntrypoint() ||
-            !outbound.getProps().isEmpty(),
-        "custom outbound services");
     rejectIf(conf.getDurableObjectNamespaces().size() != 0 ||
             conf.getDurableObjectStorage().which() != config::Worker::DurableObjectStorage::NONE ||
             conf.hasDurableObjectUniqueKeyModifier(),
@@ -5818,7 +5837,8 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 
     kj::Maybe<kj::Own<Service>> luaService = kj::none;
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
-      luaService = kj::refcounted<LuaWorkerService>(name, conf.getLuaScript(), timer);
+      luaService = kj::refcounted<LuaWorkerService>(*this, name, conf.getLuaScript(),
+          conf.getGlobalOutbound(), globalContext->headerTable, timer);
     })) {
       errorReporter.addError(
           kj::str("LuaJIT worker \"", name, "\" failed to initialize: ", exception));
