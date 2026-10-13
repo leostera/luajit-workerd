@@ -564,6 +564,10 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<const LuaBinding> bindings) 
         }
         break;
       }
+      case LuaBinding::Type::NULL_VALUE:
+        getRawField(state, -3, "null");
+        KJ_REQUIRE(!lua_isnil(state, -1), "LuaJIT null sentinel is unavailable");
+        break;
       case LuaBinding::Type::SERVICE: {
         getRawField(state, -3, "createServiceBinding");
         KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT service binding factory is unavailable");

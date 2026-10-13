@@ -1396,7 +1396,8 @@ KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings")
             tostring(#binary) .. ":" ..
             tostring(binary:byte(2)) .. ":" .. tostring(config.enabled) .. ":" ..
             tostring(config.count) .. ":" .. tostring(config.nilValue == workerd.null) .. ":" ..
-            tostring(config.list[2] == workerd.null),
+            tostring(config.list[2] == workerd.null) .. ":" ..
+            tostring(workerd.bindings.MISSING == workerd.null),
         }
       end
     }
@@ -1421,6 +1422,10 @@ KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings")
     .data = kj::heapArray<kj::byte>(0),
   });
   bindings.add(LuaBinding{
+    .name = kj::str("MISSING"),
+    .type = LuaBinding::Type::NULL_VALUE,
+  });
+  bindings.add(LuaBinding{
     .name = kj::str("CONFIG"),
     .type = LuaBinding::Type::JSON,
     .text = kj::str(R"({"enabled":true,"count":2,"nilValue":null,"list":["x",null]})"),
@@ -1431,8 +1436,8 @@ KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings")
   kj::HttpHeaders headers(headerTable);
   auto first = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
   auto second = runtime.fetch("GET"_kj, "/"_kj, headers, nullptr).wait(io.waitScope);
-  KJ_EXPECT(asString(first.body) == "hello:0:3:0:true:3:true:true");
-  KJ_EXPECT(asString(second.body) == "hello:0:3:0:true:4:true:true");
+  KJ_EXPECT(asString(first.body) == "hello:0:3:0:true:3:true:true:true");
+  KJ_EXPECT(asString(second.body) == "hello:0:3:0:true:4:true:true:true");
 }
 
 KJ_TEST("LuaJIT rejects malformed JSON bindings") {

@@ -26,6 +26,7 @@ struct LuaBinding {
     TEXT,
     DATA,
     JSON,
+    NULL_VALUE,
     SERVICE,
   };
 

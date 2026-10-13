@@ -1227,6 +1227,44 @@ KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*hello:true:true)");
 }
 
+KJ_TEST("Server: LuaJIT exposes environment-derived bindings") {
+#if _WIN32
+  _putenv("WORKERD_LUA_BINDING_PRESENT=environment value");
+  _putenv("WORKERD_LUA_BINDING_EMPTY=");
+  _putenv("WORKERD_LUA_BINDING_MISSING=");
+  KJ_DEFER({
+    _putenv("WORKERD_LUA_BINDING_PRESENT=");
+    _putenv("WORKERD_LUA_BINDING_EMPTY=");
+    _putenv("WORKERD_LUA_BINDING_MISSING=");
+  });
+#else
+  setenv("WORKERD_LUA_BINDING_PRESENT", "environment value", true);
+  setenv("WORKERD_LUA_BINDING_EMPTY", "", true);
+  unsetenv("WORKERD_LUA_BINDING_MISSING");
+  KJ_DEFER({
+    unsetenv("WORKERD_LUA_BINDING_PRESENT");
+    unsetenv("WORKERD_LUA_BINDING_EMPTY");
+    unsetenv("WORKERD_LUA_BINDING_MISSING");
+  });
+#endif
+
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() return { status = 200, body = workerd.bindings.PRESENT .. ':' .. tostring(#workerd.bindings.EMPTY) .. ':' .. tostring(workerd.bindings.MISSING == workerd.null) } end }",
+    bindings = [
+      (name = "PRESENT", fromEnvironment = "WORKERD_LUA_BINDING_PRESENT"),
+      (name = "EMPTY", fromEnvironment = "WORKERD_LUA_BINDING_EMPTY"),
+      (name = "MISSING", fromEnvironment = "WORKERD_LUA_BINDING_MISSING")
+    ]
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*environment value:0:true)");
+}
+
 KJ_TEST("Server: LuaJIT rejects duplicate binding names") {
   TestServer test(singleWorker(R"((
     luaScript = "return { fetch = function() return { status = 200, body = '' } end }",

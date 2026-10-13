@@ -5884,6 +5884,22 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
             .text = kj::str(binding.getJson()),
           });
           break;
+        case config::Worker::Binding::FROM_ENVIRONMENT: {
+          const char* value = getenv(binding.getFromEnvironment().cStr());
+          if (value == nullptr) {
+            luaBindings.add(LuaBinding{
+              .name = kj::str(bindingName),
+              .type = LuaBinding::Type::NULL_VALUE,
+            });
+          } else {
+            luaBindings.add(LuaBinding{
+              .name = kj::str(bindingName),
+              .type = LuaBinding::Type::TEXT,
+              .text = kj::str(value),
+            });
+          }
+          break;
+        }
         case config::Worker::Binding::SERVICE: {
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
