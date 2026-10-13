@@ -928,6 +928,65 @@ KJ_TEST("Server: LuaJIT fetch uses a custom global outbound service") {
       R"(HTTP/1\.1 201 LuaJIT[\s\S]*Content-Length: 13[\s\S]*Content-Type: text/plain[\s\S]*from upstream)");
 }
 
+KJ_TEST("Server: LuaJIT streams request bodies through outbound fetch") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function(r) local x = workerd.fetch({method='POST', url='https://example.com/upload', headers={{name='Content-Length', value='6'}}, body=r.bodyStream}); return {status=x.status, body=workerd.readAll(x.body)} end }",
+          globalOutbound = "custom",
+          luaRequestBodyStreaming = true
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send("POST /upload HTTP/1.1\nHost: foo\nContent-Length: 6\n\nabc");
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(
+      R"(POST https://example\.com/upload HTTP/1\.1[\s\S]*Transfer-Encoding: chunked[\s\S]*3\nabc\n)");
+
+  conn.send("def");
+  subrequest.recvRegex(R"(3\ndef\n0\n\n)");
+  subrequest.send("HTTP/1.1 201 Created\nContent-Length: 2\n\nOK");
+  conn.recvRegex(R"(HTTP/1\.1 201 LuaJIT[\s\S]*OK)");
+}
+
+KJ_TEST("Server: LuaJIT cancels an outbound body stream after client disconnect") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function(r) local x=workerd.fetch({method='POST', url='https://example.com/upload', body=r.bodyStream}); return {status=x.status, body=workerd.readAll(x.body)} end }",
+          globalOutbound = "custom",
+          luaRequestBodyStreaming = true
+        )
+      ),
+      ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send("POST /upload HTTP/1.1\nHost: foo\nContent-Length: 6\n\nabc");
+  auto subrequest = test.receiveSubrequest("proxy-host");
+  subrequest.recvRegex(R"(POST https://example\.com/upload HTTP/1\.1[\s\S]*3\nabc\n)");
+
+  conn.disconnect();
+  KJ_EXPECT_LOG(ERROR, "Uncaught exception");
+  test.wait(1);
+  KJ_EXPECT(subrequest.isEof());
+}
+
 KJ_TEST("Server: LuaJIT fetch reads outbound response bodies incrementally") {
   TestServer test(R"((
     services = [

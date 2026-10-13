@@ -44,6 +44,8 @@ struct LuaHttpRequest {
   kj::String url;
   kj::Vector<LuaHttpHeader> headers;
   kj::Array<kj::byte> body;
+  // When present, body bytes come from this request's inbound body stream.
+  kj::Maybe<kj::String> bodyStreamRequestId;
 };
 
 struct LuaHttpResponse {

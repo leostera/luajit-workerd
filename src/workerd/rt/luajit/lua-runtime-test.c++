@@ -160,6 +160,10 @@ class LuaHostOperationsWithoutRequestBody: public LuaHostOperations {
 
 class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
  public:
+  bool hasRequestBodyStream() const override {
+    return true;
+  }
+
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
     lastRequest = kj::mv(request);
     auto body = newMemoryInputStream("upstream"_kj);
@@ -437,6 +441,44 @@ KJ_TEST("LuaJIT streamed request bodies keep the total body limit") {
         .wait(io.waitScope);
   }) != kj::none);
   host.clearRequestBodyStream();
+}
+
+KJ_TEST("LuaJIT fetch forwards a request-scoped body stream handle") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        local response = workerd.fetch({
+          method = "POST",
+          url = "https://example.com/upload",
+          body = request.bodyStream,
+        })
+        return { status = response.status, body = workerd.readAll(response.body) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  TestLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime
+                      .fetch("POST"_kj, "/upload"_kj, headers, nullptr, hostOperations.getPtr(),
+                          LuaRequestBodyMode::STREAMING)
+                      .wait(io.waitScope);
+
+  KJ_EXPECT(response.status == 202);
+  KJ_EXPECT(asString(response.body) == "upstream");
+  KJ_IF_SOME(request, hostOperations.lastRequest) {
+    KJ_REQUIRE(request.body.size() == 0);
+    KJ_IF_SOME(requestId, request.bodyStreamRequestId) {
+      KJ_EXPECT(requestId == "1");
+    } else {
+      KJ_FAIL_ASSERT("inbound body stream handle was not forwarded");
+    }
+  } else {
+    KJ_FAIL_ASSERT("host fetch was not called");
+  }
 }
 
 KJ_TEST("LuaJIT outbound fetch uses runtime-neutral host operations") {
