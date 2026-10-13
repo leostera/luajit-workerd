@@ -1,7 +1,7 @@
 # LuaJIT host-capability integration: architecture and implementation
 
 - **Status:** Architecture and implementation note for experimental Lua host capabilities; this document does not define a stable API.
-- **Source snapshot:** workerd `39afee0db` (`leostera/luajit`), inspected 2026-10-13.
+- **Source snapshot:** workerd `64cfd6d07` (`leostera/luajit`), inspected 2026-10-13.
 - **Related checklist:** [feature-matrix.md](feature-matrix.md).
 
 ## Decision
