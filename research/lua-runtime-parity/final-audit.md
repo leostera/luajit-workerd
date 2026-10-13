@@ -1,6 +1,6 @@
 # LuaJIT host-capability parity audit
 
-**Status: incomplete.** This audit extends the prior matrix audit at `98760d713` with the shared `RequestScope` implementation (`7c7a49353`), opt-in inbound request-body streaming (`cbb9da4b2`), backpressured outbound pass-through and synchronous Lua upload producers, structured URL parsing, bounded random bytes, UUID generation, bounded EVP digests and HMAC generation/verification, optional request CF metadata, HTTP service bindings (`5b51bf06e`), and environment-derived bindings on `leostera/luajit`. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report summarizes verified coverage and does not upgrade partial or blocked rows into parity claims.
+**Status: incomplete.** This audit extends the prior matrix audit at `98760d713` with the shared `RequestScope` implementation (`7c7a49353`), opt-in inbound request-body streaming (`cbb9da4b2`), backpressured outbound pass-through and synchronous Lua upload producers, structured URL parsing, bounded random bytes, UUID generation, bounded EVP digests and HMAC generation/verification, optional request CF metadata, HTTP service bindings (`5b51bf06e`) and environment-derived bindings (`3fd091d3f`) on `leostera/luajit`. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report summarizes verified coverage and does not upgrade partial or blocked rows into parity claims.
 
 ## Coverage review
 
