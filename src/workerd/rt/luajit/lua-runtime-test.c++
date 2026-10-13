@@ -129,7 +129,36 @@ class RecordingSubrequestChannel final: public IoChannelFactory::SubrequestChann
   kj::Maybe<tracing::SpanContext> userParentContext;
 };
 
-class TestLuaHostOperations final: public LuaHostOperations {
+class PartialThenFailInputStream final: public kj::AsyncInputStream {
+ public:
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    KJ_REQUIRE(minBytes <= maxBytes);
+    if (readAny) KJ_FAIL_REQUIRE("injected request-body read failure");
+
+    static constexpr kj::byte bytes[] = {0, 255, 1};
+    auto size = kj::min(maxBytes, sizeof(bytes));
+    KJ_REQUIRE(size >= minBytes);
+    std::memcpy(buffer, bytes, size);
+    readAny = true;
+    return size;
+  }
+
+ private:
+  bool readAny = false;
+};
+
+class LuaHostOperationsWithoutRequestBody: public LuaHostOperations {
+ public:
+  bool hasRequestBodyStream() const override {
+    return false;
+  }
+
+  kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override {
+    KJ_FAIL_REQUIRE("mock does not provide an inbound request body stream");
+  }
+};
+
+class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
  public:
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
     lastRequest = kj::mv(request);
@@ -146,7 +175,7 @@ class TestLuaHostOperations final: public LuaHostOperations {
   kj::Maybe<LuaHttpRequest> lastRequest;
 };
 
-class CancelableLuaHostOperations final: public LuaHostOperations {
+class CancelableLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
  public:
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
     auto pair = kj::newPromiseAndFulfiller<LuaHttpResponse>();
@@ -158,14 +187,14 @@ class CancelableLuaHostOperations final: public LuaHostOperations {
   bool canceled = false;
 };
 
-class FailingLuaHostOperations final: public LuaHostOperations {
+class FailingLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
  public:
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
     KJ_FAIL_REQUIRE("mock outbound failure");
   }
 };
 
-class InterleavingLuaHostOperations final: public LuaHostOperations {
+class InterleavingLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
  public:
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
     auto pair = kj::newPromiseAndFulfiller<LuaHttpResponse>();
@@ -184,6 +213,231 @@ class InterleavingLuaHostOperations final: public LuaHostOperations {
 
   kj::Vector<kj::Own<kj::PromiseFulfiller<LuaHttpResponse>>> pending;
 };
+
+KJ_TEST("LuaJIT inbound request bodies stream in async bounded chunks") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        local first = workerd.readRequestBody(request.bodyStream, 3)
+        local second = workerd.readRequestBody(request.bodyStream, 3)
+        local eof = workerd.readRequestBody(request.bodyStream, 3)
+        return {
+          status = 200,
+          body = tostring(request.body == nil) .. ":" .. first .. second .. ":" .. tostring(eof == nil),
+        }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {}, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+      kj::refcounted<RequestObserver>());
+  auto pipe = kj::newOneWayPipe();
+  host.setRequestBodyStream(*pipe.in);
+
+  auto request = runtime.fetch(
+      "POST"_kj, "/stream"_kj, headers, nullptr, host.getPtr(), LuaRequestBodyMode::STREAMING);
+  KJ_EXPECT(!request.poll(io.waitScope));
+
+  pipe.out->write("abc"_kjb).wait(io.waitScope);
+  KJ_EXPECT(!request.poll(io.waitScope));
+
+  pipe.out->write("def"_kjb).wait(io.waitScope);
+  KJ_EXPECT(!request.poll(io.waitScope));
+  pipe.out = nullptr;
+
+  auto response = request.wait(io.waitScope);
+  host.clearRequestBodyStream();
+  KJ_EXPECT(asString(response.body) == "true:abcdef:true");
+}
+
+KJ_TEST("LuaJIT request-body chunks preserve binary bytes") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        return { status = 200, body = workerd.readRequestBody(request.bodyStream, 3) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {}, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+      kj::refcounted<RequestObserver>());
+  auto body = kj::heapArray<kj::byte>(3);
+  body[0] = 0;
+  body[1] = 255;
+  body[2] = 1;
+  auto input = newMemoryInputStream(body.asPtr());
+  host.setRequestBodyStream(*input);
+
+  auto response = runtime
+                      .fetch("POST"_kj, "/binary"_kj, headers, nullptr, host.getPtr(),
+                          LuaRequestBodyMode::STREAMING)
+                      .wait(io.waitScope);
+  host.clearRequestBodyStream();
+  KJ_REQUIRE(response.body.size() == 3);
+  KJ_EXPECT(response.body[0] == 0);
+  KJ_EXPECT(response.body[1] == 255);
+  KJ_EXPECT(response.body[2] == 1);
+}
+
+KJ_TEST("LuaJIT request-body read errors preserve earlier chunks") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        local first = workerd.readRequestBody(request.bodyStream, 3)
+        local succeeded = pcall(function()
+          workerd.readRequestBody(request.bodyStream, 3)
+        end)
+        return { status = 200, body = tostring(succeeded) .. ":" .. first }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {}, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+      kj::refcounted<RequestObserver>());
+  auto input = kj::heap<PartialThenFailInputStream>();
+  host.setRequestBodyStream(*input);
+
+  auto response = runtime
+                      .fetch("POST"_kj, "/partial-error"_kj, headers, nullptr, host.getPtr(),
+                          LuaRequestBodyMode::STREAMING)
+                      .wait(io.waitScope);
+  host.clearRequestBodyStream();
+  KJ_REQUIRE(response.body.size() == 9);
+  KJ_EXPECT(asString(response.body.asPtr().slice(0, 6)) == "false:");
+  KJ_EXPECT(response.body[6] == 0);
+  KJ_EXPECT(response.body[7] == 255);
+  KJ_EXPECT(response.body[8] == 1);
+}
+
+KJ_TEST("LuaJIT cancels a pending inbound request-body read") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        if request.url == "/next" then return { status = 200, body = "reused" } end
+        workerd.readRequestBody(request.bodyStream, 1)
+        return { status = 200, body = "unexpected" }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {}, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+      kj::refcounted<RequestObserver>());
+  auto pipe = kj::newOneWayPipe();
+  host.setRequestBodyStream(*pipe.in);
+
+  auto pending = runtime.fetch(
+      "POST"_kj, "/pending"_kj, headers, nullptr, host.getPtr(), LuaRequestBodyMode::STREAMING);
+  KJ_EXPECT(!pending.poll(io.waitScope));
+  pending = nullptr;
+  host.clearRequestBodyStream();
+
+  host.setRequestBodyStream(*pipe.in);
+  auto next = runtime
+                  .fetch("POST"_kj, "/next"_kj, headers, nullptr, host.getPtr(),
+                      LuaRequestBodyMode::STREAMING)
+                  .wait(io.waitScope);
+  host.clearRequestBodyStream();
+  KJ_EXPECT(asString(next.body) == "reused");
+}
+
+KJ_TEST("LuaJIT request-body stream handles are request-scoped") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    local previousBody
+    return {
+      fetch = function(request)
+        if previousBody ~= nil then
+          local succeeded = pcall(function()
+            workerd.readRequestBody(previousBody, 1)
+          end)
+          return { status = 200, body = tostring(succeeded) }
+        end
+        previousBody = request.bodyStream
+        return { status = 200, body = "stored" }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  {
+    LuaIoContext firstHost(*outbound, headerTable, {},
+        kj::heap<UnrestrictedSubrequestLimitPolicy>(), kj::refcounted<RequestObserver>());
+    auto firstBody = newMemoryInputStream("first"_kj);
+    firstHost.setRequestBodyStream(*firstBody);
+    auto first = runtime
+                     .fetch("POST"_kj, "/first"_kj, headers, nullptr, firstHost.getPtr(),
+                         LuaRequestBodyMode::STREAMING)
+                     .wait(io.waitScope);
+    firstHost.clearRequestBodyStream();
+    KJ_EXPECT(asString(first.body) == "stored");
+  }
+  {
+    LuaIoContext secondHost(*outbound, headerTable, {},
+        kj::heap<UnrestrictedSubrequestLimitPolicy>(), kj::refcounted<RequestObserver>());
+    auto secondBody = newMemoryInputStream("second"_kj);
+    secondHost.setRequestBodyStream(*secondBody);
+    auto second = runtime
+                      .fetch("POST"_kj, "/second"_kj, headers, nullptr, secondHost.getPtr(),
+                          LuaRequestBodyMode::STREAMING)
+                      .wait(io.waitScope);
+    secondHost.clearRequestBodyStream();
+    KJ_EXPECT(asString(second.body) == "false");
+  }
+}
+
+KJ_TEST("LuaJIT streamed request bodies keep the total body limit") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request)
+        while workerd.readRequestBody(request.bodyStream, 65536) ~= nil do end
+        return { status = 200, body = "unexpected" }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  LuaIoContext host(*outbound, headerTable, {}, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+      kj::refcounted<RequestObserver>());
+  auto body = kj::heapArray<kj::byte>(LuaRuntime::MAX_HTTP_BODY_BYTES + 1);
+  std::memset(body.begin(), 'x', body.size());
+  auto input = newMemoryInputStream(body.asPtr());
+  host.setRequestBodyStream(*input);
+
+  KJ_EXPECT(kj::runCatchingExceptions([&]() {
+    (void)runtime
+        .fetch("POST"_kj, "/too-large"_kj, headers, nullptr, host.getPtr(),
+            LuaRequestBodyMode::STREAMING)
+        .wait(io.waitScope);
+  }) != kj::none);
+  host.clearRequestBodyStream();
+}
 
 KJ_TEST("LuaJIT outbound fetch uses runtime-neutral host operations") {
   auto io = kj::setupAsyncIo();
@@ -517,7 +771,8 @@ KJ_TEST("LuaJIT worker rejects scheduled and alarm events") {
   auto outbound = kj::refcounted<InertSubrequestChannel>();
   kj::HttpHeaderTable headerTable;
   LuaWorkerInterface worker(runtime, *outbound, headerTable, {},
-      kj::heap<UnrestrictedSubrequestLimitPolicy>(), kj::refcounted<RequestObserver>());
+      kj::heap<UnrestrictedSubrequestLimitPolicy>(), kj::refcounted<RequestObserver>(),
+      LuaRequestBodyMode::BUFFERED);
 
   KJ_EXPECT(kj::runCatchingExceptions([&]() {
     worker.runScheduled(kj::UNIX_EPOCH, "*"_kj).wait(io.waitScope);

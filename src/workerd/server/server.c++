@@ -2075,12 +2075,14 @@ class Server::LuaWorkerService final: public Service {
       kj::Array<::workerd::rt::luajit::LuaBinding> bindings,
       config::ServiceDesignator::Reader globalOutbound,
       const kj::HttpHeaderTable& headerTable,
-      kj::Timer& timer)
+      kj::Timer& timer,
+      ::workerd::rt::luajit::LuaRequestBodyMode requestBodyMode)
       : server(server),
         name(kj::str(name)),
         globalOutbound(globalOutbound),
         headerTable(headerTable),
-        runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer, kj::mv(bindings))) {}
+        runtime(kj::heap<::workerd::rt::luajit::LuaRuntime>(source, timer, kj::mv(bindings))),
+        requestBodyMode(requestBodyMode) {}
 
   void link(Worker::ValidationErrorReporter&) override {
     outbound = server.lookupService(
@@ -2095,7 +2097,7 @@ class Server::LuaWorkerService final: public Service {
     KJ_REQUIRE(outbound.get() != nullptr, "LuaJIT worker has not been linked", name);
     return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(*runtime, *outbound, headerTable,
         kj::mv(metadata), kj::heap<UnrestrictedSubrequestLimitPolicy>(),
-        kj::refcounted<RequestObserver>());
+        kj::refcounted<RequestObserver>(), requestBodyMode);
   }
 
   bool hasHandler(kj::StringPtr handlerName) override {
@@ -2118,6 +2120,7 @@ class Server::LuaWorkerService final: public Service {
   const kj::HttpHeaderTable& headerTable;
   kj::Own<Service> outbound;
   kj::Own<::workerd::rt::luajit::LuaRuntime> runtime;
+  ::workerd::rt::luajit::LuaRequestBodyMode requestBodyMode;
 };
 
 class Server::InvalidConfigActorClass final: public ActorClass {
@@ -5806,6 +5809,12 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 
   ConfigErrorReporter errorReporter(*this, name);
 
+  if (!conf.isLuaScript() && conf.getLuaRequestBodyStreaming()) {
+    errorReporter.addError(
+        kj::str("Worker \"", name, "\" configures luaRequestBodyStreaming without luaScript."));
+    co_return makeInvalidConfigService();
+  }
+
   if (conf.isLuaScript()) {
     bool unsupportedConfig = false;
     auto rejectIf = [&](bool configured, kj::StringPtr feature) {
@@ -5886,8 +5895,9 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     kj::Maybe<kj::Own<Service>> luaService = kj::none;
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
       luaService = kj::refcounted<LuaWorkerService>(*this, name, conf.getLuaScript(),
-          luaBindings.releaseAsArray(), conf.getGlobalOutbound(), globalContext->headerTable,
-          timer);
+          luaBindings.releaseAsArray(), conf.getGlobalOutbound(), globalContext->headerTable, timer,
+          conf.getLuaRequestBodyStreaming() ? ::workerd::rt::luajit::LuaRequestBodyMode::STREAMING
+                                            : ::workerd::rt::luajit::LuaRequestBodyMode::BUFFERED);
     })) {
       errorReporter.addError(
           kj::str("LuaJIT worker \"", name, "\" failed to initialize: ", exception));

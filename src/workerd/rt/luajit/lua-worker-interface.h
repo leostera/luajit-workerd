@@ -27,6 +27,11 @@ class LuaIoContext final: public LuaHostOperations {
   ~LuaIoContext() noexcept(false) override;
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
+  bool hasRequestBodyStream() const override;
+  kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override;
+
+  void setRequestBodyStream(kj::AsyncInputStream& stream);
+  void clearRequestBodyStream();
 
  private:
   IoChannelFactory::SubrequestMetadata makeSubrequestMetadata(TraceContext& tracing);
@@ -39,6 +44,8 @@ class LuaIoContext final: public LuaHostOperations {
   kj::Maybe<kj::String> cfBlobJson;
   SpanParent parentSpan;
   SpanParent userSpanParent;
+  kj::Maybe<kj::AsyncInputStream&> requestBodyStream;
+  size_t requestBodyBytesRead = 0;
 };
 
 class LuaWorkerInterface final: public WorkerInterface {
@@ -48,7 +55,8 @@ class LuaWorkerInterface final: public WorkerInterface {
       const kj::HttpHeaderTable& headerTable,
       IoChannelFactory::SubrequestMetadata metadata,
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-      kj::Own<workerd::RequestObserver> observer);
+      kj::Own<workerd::RequestObserver> observer,
+      LuaRequestBodyMode requestBodyMode);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
@@ -68,6 +76,7 @@ class LuaWorkerInterface final: public WorkerInterface {
  private:
   LuaRuntime& runtime;
   LuaIoContext hostOperations;
+  LuaRequestBodyMode requestBodyMode;
 };
 
 }  // namespace workerd::rt::luajit

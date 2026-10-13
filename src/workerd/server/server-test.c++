@@ -833,6 +833,41 @@ KJ_TEST("Server: serve LuaJIT HTTP worker selected from config") {
             "lua:http://foo/lua");
 }
 
+KJ_TEST("Server: LuaJIT request-body streaming is opt-in") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function(request) local chunks = {}; while true do local chunk = workerd.readRequestBody(request.bodyStream, 2); if chunk == nil then break end; chunks[#chunks + 1] = chunk end; return { status = 200, body = tostring(request.body == nil) .. ':' .. table.concat(chunks) } end }",
+    luaRequestBodyStreaming = true
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send("POST /stream HTTP/1.1\nHost: foo\nContent-Length: 6\n\nabcdef");
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*true:abcdef)");
+}
+
+KJ_TEST("Server: LuaJIT cancels inbound body reads after client disconnect") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function(request) if request.url == 'http://foo/health' then return { status = 200, body = 'ok' } end; workerd.readRequestBody(request.bodyStream, 3); workerd.readRequestBody(request.bodyStream, 3); return { status = 200, body = 'unexpected' } end }",
+    luaRequestBodyStreaming = true
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send("POST /pending HTTP/1.1\nHost: foo\nContent-Length: 6\n\nabc");
+  test.wait(1);
+  conn.disconnect();
+  KJ_EXPECT_LOG(ERROR, "Uncaught exception");
+  test.wait(1);
+
+  auto health = test.connect("test-addr");
+  health.sendHttpGet("/health");
+  health.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*ok)");
+}
+
 KJ_TEST("Server: LuaJIT handler errors are logged and return 500") {
   TestServer test(singleWorker(R"((
     luaScript = "return { fetch = function() error('lua handler marker') end }"
@@ -982,6 +1017,18 @@ KJ_TEST("Server: LuaJIT worker requires experimental mode") {
       R"((luaScript = "return { fetch = function() return { status = 200, body = '' } end }"))"_kj));
   test.expectErrors(R"(
     service hello: LuaJIT workers are experimental; run workerd with `--experimental`.
+  )"_blockquote);
+}
+
+KJ_TEST("Server: Lua request-body streaming config requires luaScript") {
+  TestServer test(singleWorker(R"CFG((
+    serviceWorkerScript = "addEventListener('fetch', event => event.respondWith(new Response('ok')))",
+    luaRequestBodyStreaming = true
+  ))CFG"_kj));
+
+  test.server.allowExperimental();
+  test.expectErrors(R"(
+    service hello: Worker "hello" configures luaRequestBodyStreaming without luaScript.
   )"_blockquote);
 }
 

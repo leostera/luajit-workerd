@@ -58,6 +58,12 @@ struct LuaResponse {
   kj::Array<kj::byte> body;
 };
 
+enum class LuaRequestBodyMode {
+  BUFFERED,
+  // Expose request.bodyStream and host-mediated chunk reads while preserving the default mode.
+  STREAMING,
+};
+
 class LuaHostOperations: public kj::PtrTarget {
  public:
   virtual ~LuaHostOperations() noexcept(false) = default;
@@ -66,6 +72,9 @@ class LuaHostOperations: public kj::PtrTarget {
     return addPtrToThis();
   }
   virtual kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) = 0;
+  virtual bool hasRequestBodyStream() const = 0;
+  // Read up to maxBytes from the current inbound request body; return none at EOF.
+  virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) = 0;
 };
 
 class LuaRuntime final {
@@ -90,7 +99,8 @@ class LuaRuntime final {
       kj::StringPtr url,
       const kj::HttpHeaders& headers,
       kj::ArrayPtr<const kj::byte> body,
-      kj::Maybe<kj::Ptr<LuaHostOperations>> hostOperations = kj::none);
+      kj::Maybe<kj::Ptr<LuaHostOperations>> hostOperations = kj::none,
+      LuaRequestBodyMode requestBodyMode = LuaRequestBodyMode::BUFFERED);
 
  private:
   kj::Timer& timer;

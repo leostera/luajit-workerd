@@ -881,6 +881,10 @@ struct Worker {
 
   workflowsEngine @20 :WorkflowsEngine;
   # the externally-supplied service responsible for running Workflows defined in this worker
+
+  luaRequestBodyStreaming @22 :Bool = false;
+  # In LuaJIT workers, expose request.bodyStream and read it incrementally with
+  # workerd.readRequestBody(). When false, request.body remains the default buffered string.
 }
 
 struct ExternalServer {
