@@ -129,10 +129,23 @@ class IsolateLimitEnforcer: public kj::Refcounted {
 };
 
 // Abstract interface that enforces resource limits on a IoContext.
-class LimitEnforcer: public SubrequestLimitPolicy {
+class LimitEnforcer: public SubrequestLimitPolicy, public KvOperationLimitPolicy {
  public:
   void checkSubrequest(SubrequestType type) final {
     newSubrequest(type == SubrequestType::IN_HOUSE);
+  }
+  void checkKvOperation(KvOperationType operation) final {
+    switch (operation) {
+      case KvOperationType::GET:
+        newKvRequest(KvOpType::GET);
+        break;
+      case KvOperationType::PUT:
+        newKvRequest(KvOpType::PUT);
+        break;
+      case KvOperationType::DELETE:
+        newKvRequest(KvOpType::DELETE);
+        break;
+    }
   }
 
   // Called just after taking the isolate lock, before executing JavaScript code, to enforce

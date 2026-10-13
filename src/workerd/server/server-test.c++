@@ -965,6 +965,54 @@ KJ_TEST("Server: LuaJIT service bindings route fetches to the configured worker"
       R"(HTTP/1\.1 200 LuaJIT[\s\S]*first:http://target/first:second:http://target/second)");
 }
 
+KJ_TEST("Server: LuaJIT KV bindings preserve configured routing and basic operations") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function() local missing = workerd.bindings.KV.get('absent'); local value = workerd.bindings.KV.get('lookup'); workerd.bindings.KV.put('stored', 'put-value'); workerd.bindings.KV.delete('removed'); return { status = 200, body = (missing == nil and 'missing' or missing) .. ':' .. (value or 'missing') } end }",
+
+          globalOutbound = "custom",
+          bindings = [(name = "KV", kvNamespace = "kv-outbound")]
+        )
+      ),
+      ( name = "custom", external = "unused-host" ),
+      ( name = "kv-outbound", external = "kv-host" )
+    ],
+    sockets = [(name = "main", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/invoke");
+  auto missingSubrequest = test.receiveSubrequest("kv-host");
+  missingSubrequest.recv(R"(
+    GET /absent?urlencoded=true HTTP/1.1
+    Host: fake-host
+    CF-KV-FLPROD-405: https://fake-host/absent?urlencoded=true
+
+  )"_blockquote);
+  missingSubrequest.send("HTTP/1.1 404 Not Found\nContent-Length: 1\n\nx"_kj);
+  auto getSubrequest = test.receiveSubrequest("kv-host");
+  getSubrequest.recv(R"(
+    GET /lookup?urlencoded=true HTTP/1.1
+    Host: fake-host
+    CF-KV-FLPROD-405: https://fake-host/lookup?urlencoded=true
+
+  )"_blockquote);
+  getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 5\n\nvalue"_kj);
+  getSubrequest.recvRegex(
+      R"(PUT /stored\?urlencoded=true HTTP/1\.1[\s\S]*CF-KV-FLPROD-405: https://fake-host/stored\?urlencoded=true[\s\S]*put-value[\s\S]*)");
+  getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 0\n\n"_kj);
+  getSubrequest.recvRegex(
+      R"(DELETE /removed\?urlencoded=true HTTP/1\.1[\s\S]*CF-KV-FLPROD-405: https://fake-host/removed\?urlencoded=true[\s\S]*)");
+  getSubrequest.send("HTTP/1.1 200 OK\nContent-Length: 0\n\n"_kj);
+
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*missing:value)");
+}
+
 KJ_TEST("Server: LuaJIT streams Lua-produced outbound body chunks") {
   TestServer test(R"((
     services = [

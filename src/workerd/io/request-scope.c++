@@ -13,6 +13,12 @@ void RequestScope::checkSubrequest(SubrequestType type) {
   limitPolicy.checkSubrequest(type);
 }
 
+void RequestScope::checkKvOperation(KvOperationType operation) {
+  if (kvOperationLimitPolicy != nullptr) {
+    kvOperationLimitPolicy->checkKvOperation(operation);
+  }
+}
+
 kj::Own<WorkerInterface> RequestScope::wrapSubrequestClient(
     kj::Own<WorkerInterface> client, CountSubrequest countSubrequest) {
   return observer.wrapSubrequestClient(kj::mv(client), countSubrequest);

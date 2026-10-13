@@ -227,7 +227,7 @@ IoContext::IncomingRequest::IoContext_IncomingRequest(kj::Own<IoContext> context
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory)
     : context(kj::mv(contextParam)),
       metrics(kj::mv(metricsParam)),
-      requestScope(context->getLimitEnforcer(), *metrics),
+      requestScope(context->getLimitEnforcer(), *metrics, &context->getLimitEnforcer()),
       workerTracer(kj::mv(workerTracer)),
       ioChannelFactory(kj::mv(ioChannelFactoryParam)),
       accessInfo(kj::mv(accessInfo)),

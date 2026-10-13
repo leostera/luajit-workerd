@@ -83,6 +83,9 @@ class SubrequestAccountingState final: public kj::Refcounted {
   size_t admissionCalls = 0;
   SubrequestType lastType = SubrequestType::EXTERNAL;
   bool rejectSubrequest = false;
+  size_t kvAdmissionCalls = 0;
+  KvOperationType lastKvOperation = KvOperationType::GET;
+  bool rejectKvOperation = false;
   size_t observerCalls = 0;
   CountSubrequest lastCount = CountSubrequest::NO;
 };
@@ -96,6 +99,21 @@ class RecordingSubrequestLimitPolicy final: public SubrequestLimitPolicy {
     ++state->admissionCalls;
     state->lastType = type;
     KJ_REQUIRE(!state->rejectSubrequest, "subrequest rejected by request scope");
+  }
+
+ private:
+  kj::Rc<SubrequestAccountingState> state;
+};
+
+class RecordingKvOperationLimitPolicy final: public KvOperationLimitPolicy {
+ public:
+  explicit RecordingKvOperationLimitPolicy(kj::Rc<SubrequestAccountingState> state)
+      : state(kj::mv(state)) {}
+
+  void checkKvOperation(KvOperationType operation) override {
+    ++state->kvAdmissionCalls;
+    state->lastKvOperation = operation;
+    KJ_REQUIRE(!state->rejectKvOperation, "KV operation rejected by request scope");
   }
 
  private:
@@ -176,6 +194,18 @@ class LuaHostOperationsWithoutRequestBody: public LuaHostOperations {
   kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override {
     KJ_FAIL_REQUIRE("mock does not provide an inbound request body stream");
   }
+
+  kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override {
+    KJ_FAIL_REQUIRE("mock does not provide KV get()", bindingIndex, key);
+  }
+
+  kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override {
+    KJ_FAIL_REQUIRE("mock does not provide KV put()", bindingIndex, key);
+  }
+
+  kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) override {
+    KJ_FAIL_REQUIRE("mock does not provide KV delete()", bindingIndex, key);
+  }
 };
 
 class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
@@ -196,6 +226,32 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
 
   kj::Maybe<kj::String> getRequestCfJson() const override {
     return requestCfJson.map([](const kj::String& value) { return kj::str(value); });
+  }
+
+  kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override {
+    ++kvGetCalls;
+    KJ_REQUIRE(bindingIndex == 0 && key == "lookup", "unexpected KV get request");
+    if (kvGetMissing) co_return kj::none;
+    if (kvGetOversizedResponse) {
+      auto value = kj::heapArray<kj::byte>(LuaRuntime::MAX_KV_VALUE_BYTES + 1);
+      co_return LuaKvResponse{.body = newMemoryInputStream(kj::mv(value))};
+    }
+    static constexpr kj::byte value[] = {0, 255, 65};
+    co_return LuaKvResponse{.body = newMemoryInputStream(kj::arrayPtr(value))};
+  }
+
+  kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override {
+    ++kvPutCalls;
+    KJ_REQUIRE(bindingIndex == 0 && key == "stored", "unexpected KV put request");
+    KJ_REQUIRE(value.size() == 3 && value[0] == 0 && value[1] == 255 && value[2] == 65,
+        "unexpected KV put value");
+    co_return;
+  }
+
+  kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) override {
+    ++kvDeleteCalls;
+    KJ_REQUIRE(bindingIndex == 0 && key == "removed", "unexpected KV delete request");
+    co_return;
   }
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
@@ -230,6 +286,11 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   kj::Maybe<kj::String> requestCfJson = kj::none;
   size_t randomBytesCalls = 0;
   size_t randomUuidCalls = 0;
+  size_t kvGetCalls = 0;
+  size_t kvPutCalls = 0;
+  size_t kvDeleteCalls = 0;
+  bool kvGetMissing = false;
+  bool kvGetOversizedResponse = false;
 };
 
 class CancelableLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
@@ -270,6 +331,100 @@ class InterleavingLuaHostOperations final: public LuaHostOperationsWithoutReques
 
   kj::Vector<kj::Own<kj::PromiseFulfiller<LuaHttpResponse>>> pending;
 };
+
+KJ_TEST("LuaJIT KV namespace methods yield through host operations") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local value = workerd.bindings.KV.get("lookup")
+        local binary = value == string.char(0, 255, 65)
+        local putResult = workerd.bindings.KV.put("stored", string.char(0, 255, 65))
+        local deleteResult = workerd.bindings.KV.delete("removed")
+        return { status = 200, body = tostring(binary) .. ":" .. tostring(putResult == nil) .. ":" ..
+          tostring(deleteResult == nil) }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "true:true:true");
+  KJ_EXPECT(host.kvGetCalls == 1);
+  KJ_EXPECT(host.kvPutCalls == 1);
+  KJ_EXPECT(host.kvDeleteCalls == 1);
+}
+
+KJ_TEST("LuaJIT KV missing entries return nil") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        return { status = 200, body = tostring(workerd.bindings.KV.get("lookup") == nil) }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  host.kvGetMissing = true;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "true");
+  KJ_EXPECT(host.kvGetCalls == 1);
+}
+
+KJ_TEST("LuaJIT KV response bodies are bounded") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded = pcall(function() workerd.bindings.KV.get("lookup") end)
+        return { status = 200, body = tostring(succeeded) }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  host.kvGetOversizedResponse = true;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "false");
+  KJ_EXPECT(host.kvGetCalls == 1);
+}
 
 KJ_TEST("LuaJIT request.cf decodes per-request metadata as a fresh Lua table") {
   auto io = kj::setupAsyncIo();
@@ -1053,6 +1208,105 @@ KJ_TEST("LuaJIT service-binding requests preserve subrequest accounting") {
   KJ_EXPECT(accounting->lastType == SubrequestType::EXTERNAL);
   KJ_EXPECT(accounting->observerCalls == 1);
   KJ_EXPECT(accounting->lastCount == CountSubrequest::YES);
+}
+
+KJ_TEST("LuaJIT KV bindings preserve operation and in-house subrequest accounting") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local getFailure = pcall(function() workerd.bindings.KV.get("key") end)
+        local putFailure = pcall(function() workerd.bindings.KV.put("key", "value") end)
+        local deleteFailure = pcall(function() workerd.bindings.KV.delete("key") end)
+        local invalidKey = pcall(function() workerd.bindings.KV.get("") end)
+        local invalidSpecialKey = pcall(function() workerd.bindings.KV.get("..") end)
+        local oversizedKey = pcall(function() workerd.bindings.KV.get(string.rep("k", 513)) end)
+        local oversizedValue = pcall(function()
+          workerd.bindings.KV.put("key", string.rep("v", 1024 * 1024 + 1))
+        end)
+        return { status = 200, body = table.concat({tostring(getFailure), tostring(putFailure),
+          tostring(deleteFailure), tostring(invalidKey), tostring(invalidSpecialKey),
+          tostring(oversizedKey), tostring(oversizedValue)}, ":") }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  auto kvChannel = kj::refcounted<RecordingSubrequestChannel>();
+  auto* kvChannelPtr = kvChannel.get();
+  kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> kvChannels;
+  kvChannels.add(kj::addRef(*kvChannel));
+  auto accounting = kj::rc<SubrequestAccountingState>();
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  RecordingKvOperationLimitPolicy kvPolicy(accounting.addRef());
+  LuaIoContext host(*outbound, headerTable, {}, testEntropySource(),
+      kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
+      kj::refcounted<RecordingRequestObserver>(accounting.addRef()), nullptr, kvChannels.asPtr(),
+      &kvPolicy);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "false:false:false:false:false:false:false");
+  KJ_EXPECT(accounting->kvAdmissionCalls == 3);
+  KJ_EXPECT(accounting->lastKvOperation == KvOperationType::DELETE);
+  KJ_EXPECT(accounting->admissionCalls == 3);
+  KJ_EXPECT(accounting->lastType == SubrequestType::IN_HOUSE);
+  KJ_EXPECT(accounting->observerCalls == 0);
+  KJ_EXPECT(kvChannelPtr->requestsStarted == 3);
+  KJ_EXPECT(kvChannelPtr->cfBlobJson == kj::none);
+  KJ_EXPECT(outbound->requestsStarted == 0);
+}
+
+KJ_TEST("LuaJIT KV policy rejects an operation before routing") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local succeeded = pcall(function() workerd.bindings.KV.delete("key") end)
+        return { status = 200, body = tostring(succeeded) }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("KV"),
+    .type = LuaBinding::Type::KV_NAMESPACE,
+    .kvBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  auto outbound = kj::refcounted<RecordingSubrequestChannel>();
+  auto kvChannel = kj::refcounted<RecordingSubrequestChannel>();
+  kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> kvChannels;
+  kvChannels.add(kj::addRef(*kvChannel));
+  auto accounting = kj::rc<SubrequestAccountingState>();
+  accounting->rejectKvOperation = true;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  RecordingKvOperationLimitPolicy kvPolicy(accounting.addRef());
+  LuaIoContext host(*outbound, headerTable, {}, testEntropySource(),
+      kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
+      kj::refcounted<RecordingRequestObserver>(accounting.addRef()), nullptr, kvChannels.asPtr(),
+      &kvPolicy);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "false");
+  KJ_EXPECT(accounting->kvAdmissionCalls == 1);
+  KJ_EXPECT(accounting->lastKvOperation == KvOperationType::DELETE);
+  KJ_EXPECT(accounting->admissionCalls == 0);
+  KJ_EXPECT(kvChannel->requestsStarted == 0);
+  KJ_EXPECT(accounting->observerCalls == 0);
 }
 
 KJ_TEST("LuaJIT request scope rejects subrequests before routing or observation") {

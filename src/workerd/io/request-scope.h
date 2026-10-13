@@ -26,10 +26,28 @@ class SubrequestLimitPolicy {
   virtual void checkSubrequest(SubrequestType type) = 0;
 };
 
-// Policy for runtimes whose host does not enforce a subrequest quota.
+// The operation class used for a KV request's separate quota accounting.
+enum class KvOperationType {
+  GET,
+  PUT,
+  DELETE,
+};
+
+class KvOperationLimitPolicy {
+ public:
+  virtual ~KvOperationLimitPolicy() noexcept(false) = default;
+  virtual void checkKvOperation(KvOperationType operation) = 0;
+};
+
+// Policies for standalone runtimes whose host does not enforce request quotas.
 class UnrestrictedSubrequestLimitPolicy final: public SubrequestLimitPolicy {
  public:
   void checkSubrequest(SubrequestType type) override {}
+};
+
+class UnrestrictedKvOperationLimitPolicy final: public KvOperationLimitPolicy {
+ public:
+  void checkKvOperation(KvOperationType operation) override {}
 };
 
 // Shared per-invocation services for subrequest admission and observation.
@@ -40,18 +58,23 @@ class UnrestrictedSubrequestLimitPolicy final: public SubrequestLimitPolicy {
 class RequestScope final {
  public:
   // The caller owns both dependencies and must keep them alive for the scope's lifetime.
-  RequestScope(SubrequestLimitPolicy& limitPolicy, RequestObserver& observer)
+  RequestScope(SubrequestLimitPolicy& limitPolicy,
+      RequestObserver& observer,
+      KvOperationLimitPolicy* kvOperationLimitPolicy = nullptr)
       : limitPolicy(limitPolicy),
-        observer(observer) {}
+        observer(observer),
+        kvOperationLimitPolicy(kvOperationLimitPolicy) {}
   KJ_DISALLOW_COPY_AND_MOVE(RequestScope);
 
   void checkSubrequest(SubrequestType type);
+  void checkKvOperation(KvOperationType operation);
   kj::Own<WorkerInterface> wrapSubrequestClient(
       kj::Own<WorkerInterface> client, CountSubrequest countSubrequest);
 
  private:
   SubrequestLimitPolicy& limitPolicy;
   RequestObserver& observer;
+  KvOperationLimitPolicy* kvOperationLimitPolicy;
 };
 
 }  // namespace workerd

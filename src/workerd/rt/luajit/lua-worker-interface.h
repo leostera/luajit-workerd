@@ -25,12 +25,17 @@ class LuaIoContext final: public LuaHostOperations {
       kj::EntropySource& entropySource,
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
       kj::Own<workerd::RequestObserver> observer,
-      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr);
+      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr,
+      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings = nullptr,
+      KvOperationLimitPolicy* kvOperationLimitPolicy = nullptr);
   ~LuaIoContext() noexcept(false) override;
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
   bool hasRequestBodyStream() const override;
   kj::Promise<kj::Maybe<kj::Array<kj::byte>>> readRequestBody(size_t maxBytes) override;
+  kj::Promise<kj::Maybe<LuaKvResponse>> kvGet(size_t bindingIndex, kj::String key) override;
+  kj::Promise<void> kvPut(size_t bindingIndex, kj::String key, kj::Array<kj::byte> value) override;
+  kj::Promise<void> kvDelete(size_t bindingIndex, kj::String key) override;
   void fillRandomBytes(kj::ArrayPtr<kj::byte> output) override;
   kj::String generateRandomUuid() override;
   kj::Maybe<kj::String> getRequestCfJson() const override;
@@ -40,12 +45,18 @@ class LuaIoContext final: public LuaHostOperations {
 
  private:
   IoChannelFactory::SubrequestMetadata makeSubrequestMetadata(TraceContext& tracing);
+  kj::Own<kj::HttpClient> getKvHttpClient(size_t bindingIndex,
+      KvOperationType operation,
+      kj::StringPtr url,
+      kj::HttpHeaders& headers,
+      TraceContext& tracing);
 
   kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy;
   kj::Own<workerd::RequestObserver> observer;
   RequestScope requestScope;
   IoChannelFactory::SubrequestChannel& outbound;
   kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings;
+  kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings;
   const kj::HttpHeaderTable& headerTable;
   kj::EntropySource& entropySource;
   kj::Maybe<kj::String> cfBlobJson;
@@ -65,7 +76,9 @@ class LuaWorkerInterface final: public WorkerInterface {
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
       kj::Own<workerd::RequestObserver> observer,
       LuaRequestBodyMode requestBodyMode,
-      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr);
+      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr,
+      kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings = nullptr,
+      KvOperationLimitPolicy* kvOperationLimitPolicy = nullptr);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
