@@ -933,14 +933,22 @@ KJ_TEST("Server: LuaJIT service bindings route fetches to the configured worker"
     services = [
       ( name = "lua",
         worker = (
-          luaScript = "return { fetch = function() local response = workerd.bindings.TARGET.fetch({ url = 'http://target/from-service' }); return { status = response.status, body = workerd.readAll(response.body) } end }",
+          luaScript = "return { fetch = function() local first = workerd.bindings.FIRST.fetch({ url = 'http://target/first' }); local second = workerd.bindings.SECOND.fetch({ url = 'http://target/second' }); return { status = 200, body = workerd.readAll(first.body) .. ':' .. workerd.readAll(second.body) } end }",
           globalOutbound = "custom",
-          bindings = [(name = "TARGET", service = "target")]
+          bindings = [
+            (name = "FIRST", service = "target1"),
+            (name = "SECOND", service = "target2")
+          ]
         )
       ),
-      ( name = "target",
+      ( name = "target1",
         worker = (
-          luaScript = "return { fetch = function(request) return { status = 203, body = 'target:' .. request.url } end }"
+          luaScript = "return { fetch = function(request) return { status = 203, body = 'first:' .. request.url } end }"
+        )
+      ),
+      ( name = "target2",
+        worker = (
+          luaScript = "return { fetch = function(request) return { status = 204, body = 'second:' .. request.url } end }"
         )
       ),
       ( name = "custom", external = (address = "proxy-host", http = (style = proxy)) )
@@ -953,7 +961,8 @@ KJ_TEST("Server: LuaJIT service bindings route fetches to the configured worker"
 
   auto conn = test.connect("test-addr");
   conn.sendHttpGet("/invoke");
-  conn.recvRegex(R"(HTTP/1\.1 203 LuaJIT[\s\S]*target:http://target/from-service)");
+  conn.recvRegex(
+      R"(HTTP/1\.1 200 LuaJIT[\s\S]*first:http://target/first:second:http://target/second)");
 }
 
 KJ_TEST("Server: LuaJIT streams Lua-produced outbound body chunks") {
