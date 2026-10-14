@@ -2,7 +2,7 @@
 
 - **Status:** Exhaustive _family-level_ checklist; implementation status is updated incrementally and must not be read as symbol-by-symbol API parity.
 - **Architecture note:** [architecture.md](architecture.md) documents the host-operation boundary, request/coroutine ownership model, and implemented shared subrequest scope.
-- **API design backlog:** [lua-api-design-backlog.md](lua-api-design-backlog.md) turns unimplemented families into exploratory Lua API design questions; its candidate shapes are not accepted contracts.
+- **API design proposal:** [lua-api-design-proposal.md](lua-api-design-proposal.md) sketches idiomatic Lua surfaces for all 20 unimplemented families; it is a proposal, not an accepted contract.
 - **Latest audit:** [final-audit.md](final-audit.md) reports verified coverage, evidence, and material remaining gaps.
 - **Source snapshot for this inventory:** workerd `9f79d373b08a52f7865cfdfeaedf68f15cd4efec` (`leostera/luajit`), audited 2026-10-14. Re-audit the branch head after any implementation change.
 - **Goal:** Track workerd host capabilities available to JS workers and decide which have meaningful Lua equivalents. This is not an ECMAScript/V8 semantic checklist or a symbol-by-symbol inventory of every JSG member.
@@ -12,7 +12,7 @@
 
 - **AS — Supported/implemented:** The stated Lua surface exists and has targeted tests. This does not imply complete parity for its JSG family; partial coverage and exclusions are described in the current-support column.
 - **NA — Not applicable:** JavaScript-, V8-, JSG-, or internal-only feature without a useful Lua host capability.
-- **BL — Unimplemented; design/dependency outstanding:** The Lua surface is absent and one or more API-design, host-integration, lifecycle/policy, approval, or verification tasks remain. This is not a claim that the capability is impossible. See [lua-api-design-backlog.md](lua-api-design-backlog.md) for exploratory candidate shapes; no proposal there is an accepted contract.
+- **BL — Unimplemented; design/dependency outstanding:** The Lua surface is absent and one or more API-design, host-integration, lifecycle/policy, approval, or verification tasks remain. This is not a claim that the capability is impossible. See [lua-api-design-proposal.md](lua-api-design-proposal.md) for proposed Lua shapes and their prerequisites; it is not an accepted contract.
 
 ## Current Lua contract (implementation snapshot)
 
