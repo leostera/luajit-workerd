@@ -1,6 +1,6 @@
 # LuaJIT host-capability parity audit
 
-**Status: incomplete.** This inventory was re-audited against workerd `9f79d373b08a52f7865cfdfeaedf68f15cd4efec` on `leostera/luajit` (2026-10-14). Since the earlier KV/list audit it includes GET_WITH metadata/cache-status mapping, bounded GET cache TTL, and bounded PUT expiration/expiration-TTL options. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report distinguishes implemented Lua surfaces from complete JSG-family parity and does not upgrade partial or blocked rows into parity claims.
+**Status: incomplete.** This inventory was re-audited against workerd `9f79d373b08a52f7865cfdfeaedf68f15cd4efec` on `leostera/luajit` (2026-10-14). Since the earlier KV/list audit it includes GET_WITH metadata/cache-status mapping, bounded GET cache TTL, and bounded PUT expiration/expiration-TTL options. The source-of-truth checklist remains [feature-matrix.md](feature-matrix.md); this report distinguishes implemented Lua surfaces from complete JSG-family parity. Its `BL` labels mean unimplemented with design, integration, lifecycle/policy, approval, or verification work outstanding—not inherently impossible. See the exploratory [Lua API design backlog](lua-api-design-backlog.md); its candidate shapes are not accepted contracts.
 
 ## Inventory snapshot
 
@@ -8,13 +8,13 @@ The source-based inventory has three layers; they answer different questions and
 
 | Layer | Rows | Current disposition | How to read it |
 | --- | ---: | --- | --- |
-| Registered JSG API families (`rtti.c++`) | 45 | 7 supported (all partial), 18 not applicable, 20 blocked | Family-level capability mapping, not a method-by-method port of JSG. None of the seven supported families is complete JSG parity. |
-| Worker configuration and service-level surface | 35 | 12 supported in the stated Lua scope (several partial), 18 blocked, 5 not applicable | Covers routing, bindings, module/config choices, events/actors, observability, diagnostics, and limits. |
+| Registered JSG API families (`rtti.c++`) | 45 | 7 supported (all partial), 18 not applicable, 20 unimplemented/design-dependent | Family-level capability mapping, not a method-by-method port of JSG. None of the seven supported families is complete JSG parity; `BL` is not a claim of impossibility. |
+| Worker configuration and service-level surface | 35 | 12 supported in the stated Lua scope (several partial), 18 unimplemented/design-dependent, 5 not applicable | Covers routing, bindings, module/config choices, events/actors, observability, diagnostics, and limits. |
 | Runtime-neutral lifecycle and correctness checklist | 8 | 6 partial runtime/lifecycle areas, 1 experimental-only rollout row, 1 targeted-verification row | Handler-response streaming is the material missing contract; outbound `readAll()` still has no cumulative size cap. |
 
 ## Coverage review
 
-The registered JSG inventory in `src/workerd/api/rtti.c++` contains 45 groups. A source-to-matrix check found 45 matching rows, with no missing, extra, or duplicate families; classifications are 7 supported (partial), 18 not applicable, and 20 blocked. A separate check counted 35 configuration/service rows (12 supported, 18 blocked, 5 not applicable). The matrix also has eight lifecycle/checklist rows and distinguishes six partial runtime/lifecycle areas, the experimental-only rollout state, targeted verification, and the missing handler-response streaming contract. It uses `workerd.capnp`, `Server::makeWorker()`, Lua runtime/worker-interface code, and I/O interfaces as sources.
+The registered JSG inventory in `src/workerd/api/rtti.c++` contains 45 groups. A source-to-matrix check found 45 matching rows, with no missing, extra, or duplicate families; classifications are 7 supported (partial), 18 not applicable, and 20 unimplemented with design/dependency work outstanding. A separate check counted 35 configuration/service rows (12 supported, 18 unimplemented/design-dependent, 5 not applicable). The matrix also has eight lifecycle/checklist rows and distinguishes six partial runtime/lifecycle areas, the experimental-only rollout state, targeted verification, and the missing handler-response streaming contract. It uses `workerd.capnp`, `Server::makeWorker()`, Lua runtime/worker-interface code, and I/O interfaces as sources.
 
 Verified Lua capabilities are deliberately narrow:
 
@@ -45,7 +45,7 @@ The `http-network` task's contract is met for the selected experimental HTTP sur
 
 ## Acceptance required before completion
 
-The matrix currently records 20 blocked families and 18 not-applicable families, alongside partial supported surfaces. Before the overall parity goal can be marked complete, the user must accept the material exclusions documented above, especially the unverified Cloudflare production policy/metrics wiring (including KV quota injection), remaining service/storage bindings (including automatic KV response `Content-Encoding` decoding), actor/event lifecycle, specialized network/storage APIs, resource enforcement, and the response-streaming contract boundary. No handler signature, response-body type contract, or trusted-code boundary has been changed. If any listed exclusion should instead be pursued, identify it and work can continue against that scope.
+The matrix currently records 20 unimplemented families with design or dependency work outstanding, and 18 not-applicable families, alongside partial supported surfaces. Before the overall parity goal can be marked complete, the user must review the material exclusions documented above, especially unverified Cloudflare production policy/metrics wiring (including KV quota injection), remaining service/storage bindings (including automatic KV response `Content-Encoding` decoding), actor/event lifecycle, specialized network/storage APIs, resource enforcement, and the response-streaming contract boundary. No handler signature, response-body type contract, or trusted-code boundary has been changed. The exploratory [Lua API design backlog](lua-api-design-backlog.md) records candidate shapes and open decisions, not accepted designs. If any listed exclusion should instead be pursued, identify it and work can continue against that scope.
 
 ## Verification evidence
 
