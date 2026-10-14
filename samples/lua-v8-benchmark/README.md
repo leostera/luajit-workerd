@@ -1,6 +1,6 @@
 # LuaJIT and V8 HTTP benchmark
 
-This sample compares the current synchronous LuaJIT `fetch(request)` handler contract with a JavaScript `fetch(request)` Worker through the same workerd binary, HTTP server, and loopback client. It does not change the Lua API or provide `env`/`ctx`.
+This sample compares LuaJIT and V8 HTTP workers through the same workerd binary, HTTP server, and loopback client. The Lua handler uses `env.GREETING` from a configured text binding to produce the same `/hello` response as the V8 worker. Lua does not provide a `ctx` argument.
 
 Both workers expose matching endpoints:
 

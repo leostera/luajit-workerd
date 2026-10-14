@@ -6070,6 +6070,36 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
           });
           break;
         }
+        case config::Worker::Binding::WRAPPED: {
+          auto wrapped = binding.getWrapped();
+          if (wrapped.getModuleName() != "cloudflare-internal:d1-api" ||
+              wrapped.getEntrypoint() != "default") {
+            unsupportedConfig = true;
+            errorReporter.addError(kj::str("LuaJIT worker \"", name,
+                "\" only supports the default cloudflare-internal:d1-api wrapped binding; ",
+                "binding \"", bindingName, "\" uses module ", wrapped.getModuleName(), "."));
+            break;
+          }
+          auto innerBindings = wrapped.getInnerBindings();
+          if (innerBindings.size() != 1 || innerBindings[0].getName() != "fetcher" ||
+              innerBindings[0].which() != config::Worker::Binding::SERVICE) {
+            unsupportedConfig = true;
+            errorReporter.addError(kj::str("LuaJIT D1 binding \"", bindingName,
+                "\" requires exactly one inner service binding named \"fetcher\"."));
+            break;
+          }
+          auto fetcher = innerBindings[0];
+          luaBindings.add(LuaBinding{
+            .name = kj::str(bindingName),
+            .type = LuaBinding::Type::D1_DATABASE,
+            .serviceBindingIndex = luaServiceBindingConfigs.size(),
+          });
+          luaServiceBindingConfigs.add(LuaServiceBindingConfig{
+            .designator = fetcher.getService(),
+            .name = kj::str(bindingName, ".fetcher"),
+          });
+          break;
+        }
         default:
           unsupportedConfig = true;
           errorReporter.addError(kj::str("LuaJIT worker \"", name, "\" does not support binding \"",

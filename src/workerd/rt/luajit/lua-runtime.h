@@ -43,7 +43,7 @@ class LuaHmacKey final {
   kj::Array<LuaHmacKeyUsage> usages;
 };
 
-// A config binding copied into a Lua worker's service-global workerd.bindings table.
+// A configured binding in the service-global env table (`workerd.bindings` alias).
 struct LuaBinding {
   enum class Type {
     TEXT,
@@ -53,6 +53,7 @@ struct LuaBinding {
     NULL_VALUE,
     SERVICE,
     KV_NAMESPACE,
+    D1_DATABASE,
   };
 
   kj::String name;
@@ -180,12 +181,16 @@ class LuaRuntime final {
   static constexpr size_t MAX_KV_CURSOR_BYTES = 4 * 1024;
   static constexpr size_t MAX_KV_VALUE_BYTES = 1024 * 1024;
   static constexpr size_t MAX_KV_RESPONSE_BYTES = 1024 * 1024;
+  static constexpr size_t MAX_D1_SQL_BYTES = 64 * 1024;
+  static constexpr size_t MAX_D1_BINDING_VALUES = 100;
+  static constexpr size_t MAX_D1_RESPONSE_BYTES = 1024 * 1024;
 
-  // The module must return a table with a callable `fetch` field. This runtime owns one LuaJIT
-  // state for its lifetime; each fetch() and request-body producer runs on a coroutine and yields
-  // through host async operations. Coroutine access to the shared state stays serialized on the
-  // event-loop thread.
-  // Bindings are parsed and installed before the module source is evaluated.
+  // The module must return a table with a callable `fetch` field. The runtime calls it with
+  // `(request, env)`, where `env` contains configured bindings and aliases `workerd.bindings`.
+  // This runtime owns one LuaJIT state for its lifetime; each fetch() and request-body producer
+  // runs on a coroutine and yields through host async operations. Coroutine access to the shared
+  // state stays serialized on the event-loop thread. Bindings are parsed and installed before the
+  // module source is evaluated.
   LuaRuntime(
       kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<LuaBinding> bindings = nullptr);
   ~LuaRuntime() noexcept;
@@ -202,6 +207,7 @@ class LuaRuntime final {
   kj::Timer& timer;
   lua_State* state;
   int fetchHandlerRef;
+  int bindingsRef;
   int bodyProducerWrapperRef;
   uint64_t nextRequestId = 1;
 };

@@ -1367,9 +1367,41 @@ KJ_TEST("Server: LuaJIT exposes per-request CF blob metadata") {
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*US:192\.0\.2\.1)");
 }
 
+KJ_TEST("Server: LuaJIT D1 binding wraps a configured D1 service") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function(request, env) local row = env.DB:prepare('SELECT ? AS answer'):bind('bound'):first(); local result = env.DB:prepare('INSERT INTO answers(value) VALUES (?)'):bind('saved'):run(); return { status = 200, body = row.answer .. ':' .. tostring(result.meta.changes) } end }",
+          bindings = [(
+            name = "DB",
+            wrapped = (
+              moduleName = "cloudflare-internal:d1-api",
+              innerBindings = [(name = "fetcher", service = "d1")]
+            )
+          )]
+        )
+      ),
+      ( name = "d1",
+        worker = (
+          luaScript = "return { fetch = function() return { status = 200, headers = {{ name = 'content-type', value = 'application/json' }}, body = '{\\\"success\\\":true,\\\"results\\\":{\\\"columns\\\":[\\\"answer\\\"],\\\"rows\\\":[[\\\"from-d1\\\"]]},\\\"meta\\\":{\\\"duration\\\":0.1,\\\"changes\\\":1}}' } end }"
+        )
+      )
+    ],
+    sockets = [(name = "http", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*from-d1:1)");
+}
+
 KJ_TEST("Server: LuaJIT exposes configured text and JSON bindings") {
   TestServer test(singleWorker(R"((
-    luaScript = "return { fetch = function() local b = workerd.bindings; return { status = 200, body = b.GREETING .. ':' .. tostring(b.CONFIG.enabled) .. ':' .. tostring(b.CONFIG.nilValue == workerd.null) } end }",
+    luaScript = "return { fetch = function(request, env) return { status = 200, body = env.GREETING .. ':' .. tostring(env.CONFIG.enabled) .. ':' .. tostring(env.CONFIG.nilValue == workerd.null) } end }",
     bindings = [
       (name = "GREETING", text = "hello"),
       (name = "CONFIG", json = "{\"enabled\":true,\"nilValue\":null}")
@@ -1560,6 +1592,21 @@ KJ_TEST("Server: LuaJIT worker rejects unsupported bindings") {
   test.server.allowExperimental();
   test.expectErrors(R"(
     service hello: LuaJIT worker "hello" does not support binding "ignored" of this type.
+  )"_blockquote);
+}
+
+KJ_TEST("Server: LuaJIT rejects invalid D1 wrapped binding configuration") {
+  TestServer test(singleWorker(R"((
+    luaScript = "return { fetch = function() return { status = 200, body = '' } end }",
+    bindings = [(name = "DB", wrapped = (
+      moduleName = "cloudflare-internal:d1-api",
+      innerBindings = [(name = "other", service = "d1")]
+    ))]
+  ))"_kj));
+
+  test.server.allowExperimental();
+  test.expectErrors(R"(
+    service hello: LuaJIT D1 binding "DB" requires exactly one inner service binding named "fetcher".
   )"_blockquote);
 }
 

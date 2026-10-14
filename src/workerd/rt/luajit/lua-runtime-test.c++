@@ -324,6 +324,23 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   }
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    if (d1MockEnabled) {
+      KJ_IF_SOME(bindingIndex, request.serviceBindingIndex) {
+        KJ_REQUIRE(bindingIndex == 0, "unexpected D1 service binding index");
+      } else {
+        KJ_FAIL_REQUIRE("D1 query did not use its configured service binding");
+      }
+      KJ_REQUIRE(request.method == "POST", "D1 service request must use POST");
+      d1RequestUrls.add(kj::str(request.url));
+      d1RequestBodies.add(asString(request.body.asPtr()));
+      bool execute = request.url == "http://d1/execute?resultsFormat=NONE";
+      KJ_REQUIRE(execute || request.url == "http://d1/query?resultsFormat=ROWS_AND_COLUMNS",
+          "unexpected D1 request URL", request.url);
+      auto responseBody = newMemoryInputStream(
+          execute ? kj::StringPtr(d1RunResponse) : kj::StringPtr(d1QueryResponse));
+      co_return LuaHttpResponse{.status = 200, .headers = {}, .body = kj::mv(responseBody)};
+    }
+
     if (request.bodyProducer != kj::none) {
       KJ_IF_SOME(producer, request.bodyProducer) {
         while (true) {
@@ -350,6 +367,11 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   }
 
   kj::Maybe<LuaHttpRequest> lastRequest;
+  bool d1MockEnabled = false;
+  kj::String d1QueryResponse = kj::str("");
+  kj::String d1RunResponse = kj::str("");
+  kj::Vector<kj::String> d1RequestUrls;
+  kj::Vector<kj::String> d1RequestBodies;
   kj::Vector<kj::Array<kj::byte>> bodyProducerChunks;
   bool bodyProducerReachedEof = false;
   kj::Maybe<kj::String> requestCfJson = kj::none;
@@ -2083,6 +2105,128 @@ KJ_TEST("LuaJIT service binding fetches select their configured channel") {
   } else {
     KJ_FAIL_ASSERT("service binding fetch should reach the host");
   }
+}
+
+KJ_TEST("LuaJIT passes configured bindings as fetch env") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request, env)
+        env.calls = (env.calls or 0) + 1
+        return {
+          status = 200,
+          body = env.GREETING .. ":" .. request.url .. ":" .. tostring(env.calls) .. ":" ..
+            tostring(env == workerd.bindings),
+        }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("GREETING"),
+    .type = LuaBinding::Type::TEXT,
+    .text = kj::str("hello"),
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto first = runtime.fetch("GET"_kj, "/first"_kj, headers, nullptr).wait(io.waitScope);
+  auto second = runtime.fetch("GET"_kj, "/second"_kj, headers, nullptr).wait(io.waitScope);
+  KJ_EXPECT(asString(first.body) == "hello:/first:1:true");
+  KJ_EXPECT(asString(second.body) == "hello:/second:2:true");
+}
+
+KJ_TEST("LuaJIT D1 binding supports prepared first, all, and run queries") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(request, env)
+        local statement = env.DB:prepare("SELECT ? AS answer"):bind(
+          "hello", 2.5, true, workerd.null, nil)
+        local first = statement:first("answer")
+        local all = statement:all()
+        local run = env.DB:prepare("INSERT INTO answers(value) VALUES (?)"):bind("saved"):run()
+        return {
+          status = 200,
+          body = first .. ":" .. all.results[1].answer .. ":" .. tostring(run.meta.changes),
+        }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("DB"),
+    .type = LuaBinding::Type::D1_DATABASE,
+    .serviceBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  host.d1MockEnabled = true;
+  host.d1QueryResponse = kj::str(
+      R"({"success":true,"results":{"columns":["answer"],"rows":[["hello"]]},"meta":{"duration":0.1,"changes":0}})");
+  host.d1RunResponse =
+      kj::str(R"({"success":true,"results":[],"meta":{"duration":0.2,"changes":1}})");
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) == "hello:hello:1");
+  KJ_EXPECT(host.d1RequestUrls.size() == 3);
+  KJ_EXPECT(host.d1RequestUrls[0] == "http://d1/query?resultsFormat=ROWS_AND_COLUMNS");
+  KJ_EXPECT(host.d1RequestUrls[2] == "http://d1/execute?resultsFormat=NONE");
+  KJ_EXPECT(host.d1RequestBodies[0] ==
+      R"({"sql":"SELECT ? AS answer","params":["hello",2.5,true,null,null]})");
+  KJ_EXPECT(host.d1RequestBodies[2] ==
+      R"json({"sql":"INSERT INTO answers(value) VALUES (?)","params":["saved"]})json");
+}
+
+KJ_TEST("LuaJIT D1 query text and string parameters require valid UTF-8") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr invalidSql = R"lua(
+    return {
+      fetch = function(_, env)
+        return env.DB:prepare(string.char(255)):all()
+      end
+    }
+  )lua"_kj;
+  constexpr kj::StringPtr invalidParameter = R"lua(
+    return {
+      fetch = function(_, env)
+        return env.DB:prepare("SELECT ?"):bind(string.char(255)):all()
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("DB"),
+    .type = LuaBinding::Type::D1_DATABASE,
+    .serviceBindingIndex = 0,
+  });
+  TestLuaHostOperations host;
+  host.d1MockEnabled = true;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  LuaRuntime sqlRuntime(invalidSql, io.provider->getTimer(), kj::mv(bindings).releaseAsArray());
+  KJ_EXPECT_THROW(FAILED,
+      sqlRuntime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope));
+
+  kj::Vector<LuaBinding> parameterBindings;
+  parameterBindings.add(LuaBinding{
+    .name = kj::str("DB"),
+    .type = LuaBinding::Type::D1_DATABASE,
+    .serviceBindingIndex = 0,
+  });
+  LuaRuntime parameterRuntime(
+      invalidParameter, io.provider->getTimer(), parameterBindings.releaseAsArray());
+  KJ_EXPECT_THROW(FAILED,
+      parameterRuntime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope));
+  KJ_EXPECT(host.d1RequestUrls.size() == 0);
 }
 
 KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings") {

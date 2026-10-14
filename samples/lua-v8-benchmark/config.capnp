@@ -13,6 +13,7 @@ const config :Workerd.Config = (
 
 const luaWorker :Workerd.Worker = (
   luaScript = embed "worker.lua",
+  bindings = [(name = "GREETING", text = "hello")],
 );
 
 const v8Worker :Workerd.Worker = (

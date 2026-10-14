@@ -19,10 +19,10 @@ local function runCpuLoop(iterations)
 end
 
 return {
-  fetch = function(request)
+  fetch = function(request, env)
     local path = string.match(request.url, "^[^:]+://[^/]+([^?#]*)")
     if path == "/hello" then
-      return response("hello\n", "text/plain")
+      return response(env.GREETING .. "\n", "text/plain")
     end
 
     local iterationParameter = string.match(request.url, "[?&]iters=([^&#]*)")

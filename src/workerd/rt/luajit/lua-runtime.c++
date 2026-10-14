@@ -14,6 +14,7 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <simdutf.h>
 
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
@@ -21,6 +22,7 @@
 #include <kj/debug.h>
 
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <new>
 
@@ -124,6 +126,84 @@ function workerd.createKvNamespace(kvBindingIndex)
         kvBindingIndex = kvBindingIndex,
         options = options,
       })
+    end,
+  }
+end
+
+function workerd.createD1Database(serviceBindingIndex)
+  local function makeStatement(sql, params)
+    local function execute(mode)
+      local result = workerd.await({
+        operation = "d1Query",
+        serviceBindingIndex = serviceBindingIndex,
+        sql = sql,
+        params = params,
+        mode = mode,
+      })
+      if type(result) ~= "table" or result.success ~= true then
+        local message = type(result) == "table" and result.error or nil
+        error("D1_ERROR: " .. tostring(message or "D1 query failed"), 2)
+      end
+      return result
+    end
+
+    local function all()
+      local result = execute("all")
+      local rowsAndColumns = result.results
+      if type(rowsAndColumns) ~= "table" or type(rowsAndColumns.columns) ~= "table" or
+          type(rowsAndColumns.rows) ~= "table" then
+        error("D1_ERROR: malformed rows-and-columns response", 2)
+      end
+      local rows = {}
+      for rowIndex, values in ipairs(rowsAndColumns.rows) do
+        if type(values) ~= "table" then
+          error("D1_ERROR: malformed row in query response", 2)
+        end
+        local row = {}
+        for columnIndex, name in ipairs(rowsAndColumns.columns) do
+          if type(name) ~= "string" then
+            error("D1_ERROR: malformed column name in query response", 2)
+          end
+          row[name] = values[columnIndex]
+        end
+        rows[rowIndex] = row
+      end
+      result.results = rows
+      return result
+    end
+
+    return {
+      bind = function(_, ...)
+        local bound = { n = select("#", ...) }
+        if bound.n > 100 then error("D1 bind() accepts at most 100 values", 2) end
+        for i = 1, bound.n do bound[i] = select(i, ...) end
+        return makeStatement(sql, bound)
+      end,
+      all = all,
+      first = function(_, columnName)
+        local rows = all().results
+        local row = rows[1]
+        if row == nil then return nil end
+        if columnName ~= nil then
+          if type(columnName) ~= "string" then
+            error("D1 first() column name must be a string", 2)
+          end
+          if row[columnName] == nil then
+            error("D1_COLUMN_NOTFOUND: Column not found (" .. columnName .. ")", 2)
+          end
+          return row[columnName]
+        end
+        return row
+      end,
+      run = function() return execute("run") end,
+    }
+  end
+
+  return {
+    prepare = function(_, sql)
+      if type(sql) ~= "string" then error("D1 prepare() requires a SQL string", 2) end
+      if #sql > 65536 then error("D1 prepare() SQL exceeds the 65536-byte limit", 2) end
+      return makeStatement(sql, { n = 0 })
     end,
   }
 end
@@ -827,6 +907,16 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<LuaBinding> bindings) {
         KJ_REQUIRE(status == 0, "failed to create Lua KV binding:", readLuaErrorMessage(state));
         break;
       }
+      case LuaBinding::Type::D1_DATABASE: {
+        getRawField(state, -3, "createD1Database");
+        KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT D1 binding factory is unavailable");
+        KJ_REQUIRE(binding.serviceBindingIndex < static_cast<size_t>(INT_MAX),
+            "too many Lua service bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(binding.serviceBindingIndex + 1));
+        int status = lua_pcall(state, 1, 1, 0);
+        KJ_REQUIRE(status == 0, "failed to create Lua D1 binding:", readLuaErrorMessage(state));
+        break;
+      }
     }
     lua_rawset(state, -3);
   }
@@ -835,6 +925,8 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<LuaBinding> bindings) {
   lua_setfield(state, -2, "createServiceBinding");
   lua_pushnil(state);
   lua_setfield(state, -2, "createKvNamespace");
+  lua_pushnil(state);
+  lua_setfield(state, -2, "createD1Database");
   lua_pop(state, 1);
 }
 
@@ -1060,6 +1152,170 @@ struct LuaKvListRequest {
   LuaKvListOptions options;
 };
 
+struct LuaD1QueryRequest {
+  size_t bindingIndex;
+  bool execute;
+  kj::String body;
+};
+
+void requireD1Utf8(kj::StringPtr value, kj::StringPtr context) {
+  KJ_REQUIRE(
+      simdutf::validate_utf8(value.begin(), value.size()), "D1", context, "must be valid UTF-8");
+}
+
+void appendJsonString(kj::Vector<char>& output, kj::StringPtr value) {
+  static constexpr char HEX[] = "0123456789abcdef";
+  output.add('"');
+  for (unsigned char byte: value) {
+    if (byte == '"' || byte == '\\') {
+      output.add('\\');
+      output.add(static_cast<char>(byte));
+    } else if (byte == '\b' || byte == '\f' || byte == '\n' || byte == '\r' || byte == '\t') {
+      output.add('\\');
+      switch (byte) {
+        case '\b':
+          output.add('b');
+          break;
+        case '\f':
+          output.add('f');
+          break;
+        case '\n':
+          output.add('n');
+          break;
+        case '\r':
+          output.add('r');
+          break;
+        case '\t':
+          output.add('t');
+          break;
+      }
+    } else if (byte < 0x20) {
+      output.add('\\');
+      output.add('u');
+      output.add('0');
+      output.add('0');
+      output.add(HEX[byte >> 4]);
+      output.add(HEX[byte & 0x0f]);
+    } else {
+      output.add(static_cast<char>(byte));
+    }
+  }
+  output.add('"');
+}
+
+bool isWorkerdNullValue(lua_State* state, int index) {
+  index = absoluteIndex(state, index);
+  lua_getglobal(state, "workerd");
+  getRawField(state, -1, "null");
+  bool result = lua_rawequal(state, index, -1);
+  lua_pop(state, 2);
+  return result;
+}
+
+kj::String serializeD1RequestBody(lua_State* state, kj::StringPtr sql, int paramsIndex) {
+  paramsIndex = absoluteIndex(state, paramsIndex);
+  getRawField(state, paramsIndex, "n");
+  int isNumber = 0;
+  lua_Integer count = lua_tointegerx(state, -1, &isNumber);
+  bool validCount = lua_type(state, -1) == LUA_TNUMBER && isNumber && count >= 0 &&
+      static_cast<uint64_t>(count) <= LuaRuntime::MAX_D1_BINDING_VALUES &&
+      static_cast<lua_Number>(count) == lua_tonumber(state, -1);
+  lua_pop(state, 1);
+  KJ_REQUIRE(validCount, "D1 binding accepts at most", LuaRuntime::MAX_D1_BINDING_VALUES, "values");
+  KJ_REQUIRE(sql.size() <= LuaRuntime::MAX_D1_SQL_BYTES, "D1 SQL exceeds limit",
+      LuaRuntime::MAX_D1_SQL_BYTES);
+  requireD1Utf8(sql, "SQL text");
+
+  kj::Vector<char> output;
+  output.add('{');
+  appendJsonString(output, "sql"_kj);
+  output.add(':');
+  appendJsonString(output, sql);
+  output.add(',');
+  appendJsonString(output, "params"_kj);
+  output.add(':');
+  output.add('[');
+  for (lua_Integer i = 1; i <= count; ++i) {
+    if (i > 1) output.add(',');
+    lua_rawgeti(state, paramsIndex, static_cast<int>(i));
+    switch (lua_type(state, -1)) {
+      case LUA_TNIL:
+        output.addAll("null"_kj.asArray());
+        break;
+      case LUA_TSTRING: {
+        size_t length = 0;
+        const char* value = lua_tolstring(state, -1, &length);
+        auto stringValue = kj::StringPtr(value, length);
+        requireD1Utf8(stringValue, "string binding value");
+        appendJsonString(output, stringValue);
+        break;
+      }
+      case LUA_TNUMBER: {
+        double value = lua_tonumber(state, -1);
+        KJ_REQUIRE(std::isfinite(value), "D1 binding values must be finite numbers");
+        auto number = kj::str(value);
+        output.addAll(number.asArray());
+        break;
+      }
+      case LUA_TBOOLEAN:
+        output.addAll(lua_toboolean(state, -1) ? "true"_kj.asArray() : "false"_kj.asArray());
+        break;
+      case LUA_TTABLE:
+        if (isWorkerdNullValue(state, -1)) {
+          output.addAll("null"_kj.asArray());
+        } else {
+          lua_pop(state, 1);
+          KJ_FAIL_REQUIRE(
+              "D1 binding values support only strings, finite numbers, booleans, and null");
+        }
+        break;
+      default:
+        lua_pop(state, 1);
+        KJ_FAIL_REQUIRE(
+            "D1 binding values support only strings, finite numbers, booleans, and null");
+    }
+    lua_pop(state, 1);
+  }
+  output.add(']');
+  output.add('}');
+  KJ_REQUIRE(output.size() <= LuaRuntime::MAX_HTTP_BODY_BYTES, "D1 query request exceeds limit",
+      LuaRuntime::MAX_HTTP_BODY_BYTES);
+  return kj::heapString(output.begin(), output.size());
+}
+
+LuaD1QueryRequest readD1QueryRequest(lua_State* state, int descriptorIndex) {
+  descriptorIndex = absoluteIndex(state, descriptorIndex);
+  size_t bindingIndex = 0;
+  KJ_IF_SOME(index, readOptionalServiceBindingIndex(state, descriptorIndex)) {
+    bindingIndex = index;
+  } else {
+    KJ_FAIL_REQUIRE("D1 query requires a configured D1 service binding");
+  }
+  auto sql = readStringField(state, descriptorIndex, "sql");
+  getRawField(state, descriptorIndex, "mode");
+  bool execute = false;
+  if (lua_type(state, -1) == LUA_TSTRING) {
+    size_t length = 0;
+    const char* value = lua_tolstring(state, -1, &length);
+    kj::StringPtr mode(value, length);
+    KJ_REQUIRE(mode == "all" || mode == "run", "unsupported D1 query mode", mode);
+    execute = mode == "run";
+  } else {
+    lua_pop(state, 1);
+    KJ_FAIL_REQUIRE("D1 query mode must be 'all' or 'run'");
+  }
+  lua_pop(state, 1);
+  getRawField(state, descriptorIndex, "params");
+  KJ_REQUIRE(lua_istable(state, -1), "D1 query parameters must be a table");
+  auto body = serializeD1RequestBody(state, sql, -1);
+  lua_pop(state, 1);
+  return LuaD1QueryRequest{
+    .bindingIndex = bindingIndex,
+    .execute = execute,
+    .body = kj::mv(body),
+  };
+}
+
 size_t readKvBindingIndex(lua_State* state, int descriptorIndex) {
   descriptorIndex = absoluteIndex(state, descriptorIndex);
   getRawField(state, descriptorIndex, "kvBindingIndex");
@@ -1260,6 +1516,21 @@ kj::Promise<kj::Array<kj::byte>> readLuaKvResponseBody(kj::Own<kj::AsyncInputStr
   co_return value.releaseAsArray();
 }
 
+kj::Promise<kj::Array<kj::byte>> readLuaD1ResponseBody(kj::Own<kj::AsyncInputStream> body) {
+  kj::Vector<kj::byte> value;
+  while (value.size() <= LuaRuntime::MAX_D1_RESPONSE_BYTES) {
+    size_t maxBytes =
+        kj::min<size_t>(16 * 1024, LuaRuntime::MAX_D1_RESPONSE_BYTES + 1 - value.size());
+    auto chunk = kj::heapArray<kj::byte>(maxBytes);
+    size_t bytesRead = co_await body->tryRead(chunk.begin(), 1, maxBytes);
+    if (bytesRead == 0) break;
+    KJ_REQUIRE(bytesRead <= LuaRuntime::MAX_D1_RESPONSE_BYTES - value.size(),
+        "D1 response exceeds limit", LuaRuntime::MAX_D1_RESPONSE_BYTES);
+    value.addAll(chunk.asPtr().first(bytesRead));
+  }
+  co_return value.releaseAsArray();
+}
+
 LuaBodyReadRequest readBodyReadRequest(lua_State* state) {
   int descriptorIndex = absoluteIndex(state, -1);
   auto requestId = readBodyRequestId(state, descriptorIndex);
@@ -1297,7 +1568,8 @@ using LuaHostOperation = kj::OneOf<kj::Duration,
     LuaKvGetRequest,
     LuaKvPutRequest,
     LuaKvDeleteRequest,
-    LuaKvListRequest>;
+    LuaKvListRequest,
+    LuaD1QueryRequest>;
 
 LuaHostOperation readHostOperation(
     lua_State* state, kj::Rc<LuaRequestContext> requestContext, int bodyProducerWrapperRef) {
@@ -1366,6 +1638,9 @@ LuaHostOperation readHostOperation(
       .bindingIndex = readKvBindingIndex(state, descriptorIndex),
       .options = readKvListOptions(state, descriptorIndex),
     };
+  }
+  if (name == "d1Query") {
+    return readD1QueryRequest(state, absoluteIndex(state, -1));
   }
   if (name == "readBody") return readBodyReadRequest(state);
   if (name == "readRequestBody") {
@@ -1598,6 +1873,36 @@ kj::Promise<void> LuaRequestContext::execute(lua_State* coroutine, LuaHostOperat
         KJ_FAIL_REQUIRE("workerd.bindings KV list() is unavailable in this context");
       }
     }
+    KJ_CASE_ONEOF(d1Query, LuaD1QueryRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        auto requestBody = kj::heapArray<kj::byte>(d1Query.body.size());
+        if (requestBody.size() > 0) {
+          std::memcpy(requestBody.begin(), d1Query.body.begin(), requestBody.size());
+        }
+        kj::Vector<LuaHttpHeader> headers;
+        headers.add(
+            LuaHttpHeader{.name = kj::str("content-type"), .value = kj::str("application/json")});
+        auto response = co_await host->fetch(LuaHttpRequest{
+          .method = kj::str("POST"),
+          .url = d1Query.execute ? kj::str("http://d1/execute?resultsFormat=NONE")
+                                 : kj::str("http://d1/query?resultsFormat=ROWS_AND_COLUMNS"),
+          .headers = kj::mv(headers),
+          .body = kj::mv(requestBody),
+          .serviceBindingIndex = kj::some(static_cast<size_t>(d1Query.bindingIndex)),
+        });
+        auto responseBody = co_await readLuaD1ResponseBody(kj::mv(response.body));
+        if (response.status < 200 || response.status >= 300) {
+          KJ_FAIL_REQUIRE("D1 service returned HTTP status", response.status, ":",
+              kj::StringPtr(
+                  reinterpret_cast<const char*>(responseBody.begin()), responseBody.size()));
+        }
+        const char* json =
+            responseBody.size() == 0 ? "" : reinterpret_cast<const char*>(responseBody.begin());
+        pushJsonText(coroutine, kj::StringPtr(json, responseBody.size()));
+      } else {
+        KJ_FAIL_REQUIRE("D1 bindings are unavailable in this context");
+      }
+    }
     KJ_CASE_ONEOF(cancelRequest, LuaBodyCancelRequest) {
       KJ_REQUIRE(cancelRequest.requestId == requestId,
           "workerd.cancelBody() cannot use a stream from another request");
@@ -1735,6 +2040,7 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<L
     : timer(timer),
       state(luaL_newstate()),
       fetchHandlerRef(LUA_NOREF),
+      bindingsRef(LUA_NOREF),
       bodyProducerWrapperRef(LUA_NOREF) {
   KJ_REQUIRE(state != nullptr, "could not create LuaJIT state");
   bool keepState = false;
@@ -1758,6 +2064,11 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<L
   lua_setfield(state, -2, "_makeBodyProducer");
   lua_pop(state, 1);
   pushLuaBindings(state, bindings.asPtr());
+  lua_getglobal(state, "workerd");
+  getRawField(state, -1, "bindings");
+  KJ_REQUIRE(lua_istable(state, -1), "LuaJIT configured bindings table is unavailable");
+  bindingsRef = luaL_ref(state, LUA_REGISTRYINDEX);
+  lua_pop(state, 1);
   lua_getglobal(state, "workerd");
   lua_pushcfunction(state, parseUrl);
   lua_setfield(state, -2, "parseUrl");
@@ -1847,9 +2158,11 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
     }
   }
 
+  lua_rawgeti(coroutine, LUA_REGISTRYINDEX, bindingsRef);
+
   auto requestContext = kj::rc<LuaRequestContext>(
       timer, kj::mv(hostOperations), requestBodyMode, kj::str(requestId), bodyProducerWrapperRef);
-  int status = lua_resume(coroutine, 1);
+  int status = lua_resume(coroutine, 2);
   status = co_await resumeLuaCoroutine(coroutine, status, requestContext.addRef());
   KJ_REQUIRE(status == 0, "LuaJIT fetch() failed:", readLuaErrorMessage(coroutine));
   KJ_REQUIRE(lua_istable(coroutine, -1), "LuaJIT fetch() must return a response table");
