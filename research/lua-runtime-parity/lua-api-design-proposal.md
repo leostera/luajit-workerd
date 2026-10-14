@@ -70,12 +70,63 @@ The names below are proposed names, not existing APIs. `workerd.bindings.NAME` m
 | `performance` | `workerd.performance.now()` returns monotonic milliseconds from the invocation's workerd `TimerChannel`; `timeOrigin` is omitted initially. | Runtime-neutral host operation only; never call `kj::Timer` directly. Keep the clock Spectre-mitigated and timeout-clamped like the standard request path. Specify precision and consistency with `workerd.sleep()`; test monotonicity and that no cross-request timer handle escapes. |
 | `tracing` | `workerd.tracing.withSpan(name, attributes, function(span) ... end)`; `span:setAttribute`, `span:addEvent`, and `span:recordError` are available only during the callback. | The host creates a child span under the request parent, runs the callback in the same Lua coroutine (which may yield at host operations), closes the span on all exits, marks thrown errors, and rethrows them. Span handles cannot escape the callback or request. Define attribute types/limits and observer/metrics policy; do not expose KJ span objects. |
 
-## Dependencies and implementation order
+## Configuration, lifecycle, and operational design
+
+The configuration matrix has additional rows that do not map one-to-one to JSG families. These decisions prevent service/config behavior from being mistaken for API parity.
+
+| Configuration/service row | Proposed Lua contract or explicit disposition |
+| --- | --- |
+| Handler response-body streaming | Accept `body = workerd.stream.producer(...)` as an additive response-body variant beside existing strings. Preserve the 1 MiB string limit. Requires explicit user approval, response backpressure/cancellation semantics, and server disconnect tests before implementation. |
+| Asynchronous Lua-generated bodies | Outbound request-body producers now run in a host-managed child coroutine, are pulled only on demand, and may yield through existing host operations; cancellation and byte limits remain tied to the request. This does not alter the handler response contract. Streaming handler response bodies still require explicit approval, response backpressure/cancellation semantics, and server disconnect tests before implementation. |
+| Cache API outbound route | Expose `workerd.cache.default` through a separately linked Cache capability. Do not alias it to `globalOutbound` or `workerd.fetch()`. Cache policy, namespace, and body limits come from configuration/host policy. |
+| Durable Object, R2, Queue, Analytics, Hyperdrive bindings | Use the per-family interfaces above. Each binding is parsed and linked at service construction; runtime Lua receives a typed capability, not a URL or raw channel. Reject unsupported binding types before serving. |
+| Parameter/inheritance bindings | Do not implicitly merge inherited Lua workers or inject a generic `env`. If a use case needs immutable configuration values, add a typed `luaParameters` config and expose a startup snapshot as `workerd.parameters`; keep service bindings separately under `workerd.bindings`. Defer parent-worker inheritance until precedence, source ownership, and service-state lifetimes are specified. |
+| Wrapped binding | Do not run the current JS `env` wrapper around Lua bindings. If wrappers are needed, define a language-neutral host-side capability decorator (policy/validation/metrics) before Lua module evaluation; otherwise keep this internal binding unavailable to Lua. |
+| Unsafe-eval, memory cache, Worker Loader, debug port | Keep unsafe-eval as no added capability; Lua's trusted-code status does not justify more dynamic loading. Expose memory cache and the restricted, predeclared Worker Loader only through the separate designs above. V8 debug-port semantics are not applicable; any Lua debugger must be a separate development-only design. |
+| Module fallback/extensions | Retain one configured Lua chunk and the returned handler table. Do not load JS ESM/CJS or V8 extensions as Lua modules. A future multi-file loader must define Lua `require`/package roots, code provenance, caching, startup errors, and native-module policy independently. |
+| Inheritance/derived workers | No implicit service inheritance in the first design. Prefer explicit configuration and named bindings; revisit only with clear merge rules for source, bindings, and the service-global Lua state. |
+| Scheduled events | Optional `scheduled(event)` export; event receives its own scope/trace/cancellation, returns success or raises for retry policy. No implicit `waitUntil`. Specify maximum duration, retry ownership, and overlap with HTTP requests first. |
+| Durable Object namespaces/storage, alarms, uniqueness | Use the actor factory, per-object Lua state, stub, and actor `state` capability above. IDs and uniqueness are host-generated/validated. Alarm callback is optional on the actor table and uses actor storage's alarm API; it is not a service-global timer. |
+| Workflows | Optional `workflow = function(event) ... end` plus a configured `workerd.bindings.FLOWS:create(id, input)` capability. Each instance has host-owned durable state and explicit `step(name, fn)`/retry records; no automatic reuse of actor storage or `waitUntil`. Defer until workflow checkpoint, replay/idempotency, timeout, and cancellation semantics are designed. |
+| Tail and streaming tail workers | Optional `tail = function(batch) ... end` receives bounded, redacted event records from a separate observer context; it cannot recursively generate tail events. Preserve delivery backpressure and shutdown; define access controls, log/trace schemas, redaction, batching, and drop policy before exposure. |
+| Access metadata/binding | Add an optional immutable per-request `request.access` snapshot only when supplied by an authenticated host Access context; never derive identity from user headers or `request.cf` JSON. Define provenance, absent/invalid behavior, and field-level redaction. Do not provide a generic secret-bearing identity binding. |
+| Container engine/DO containers | Use the configured `BUILD:exec(argv)` process capability above. Choose actor-scoped versus service-scoped lifecycle explicitly, and rely on host-enforced image, filesystem, egress, and resource policies. Depends on container engine availability and security review. |
+| Worker Loader dynamic worker creation | V1 only loads operator-predeclared names via `LOADER:load(name)`; it does not accept source text or caller-supplied capabilities. Arbitrary dynamic code remains outside scope until trust, isolation, resource, and unload semantics receive explicit approval. |
+| Runtime logs, metrics, tracing | Keep `workerd.tracing.withSpan()` from the family design. Add `workerd.log:write(level, fields)` and `workerd.metrics:record(name, value, labels)` only through request-scoped host interfaces with structured bounded fields, redaction, and sampling. Errors continue to be catchable Lua errors; the server logs uncaught failures. Production provider injection must be verified separately. |
+| Inspector, DevTools, compile cache, heap/GC diagnostics | No V8 inspector/compile cache/heap API. Consider a Lua-specific local debugger and Lua-state allocator/GC diagnostics independently; do not expose a V8-compatible debug port. |
+| Runtime resource enforcement | First meter Lua allocations with a per-state allocator and establish per-service memory ceilings. Investigate a sound LuaJIT instruction/time budget that remains effective with JIT enabled; until verified, make no hard CPU-quota or preemption claim. A synchronous infinite loop remains a deployment risk under trusted-code-only status. |
+
+### Lifecycle and correctness contracts
+
+| Concern | Proposed disposition |
+| --- | --- |
+| Request body | Keep buffered string as the default; retain opt-in bounded `request.bodyStream`. Each handle belongs to one request and closes on completion/cancellation. |
+| Response body | Keep string results unchanged; consider the stream-producer variant only after explicit approval. Enforce demand-driven backpressure, byte limits, exactly-once close, and disconnect cancellation. |
+| Headers | Preserve ordered `{name, value}` arrays so duplicate headers survive. Validate through workerd's HTTP header table; never coerce invalid bytes or merge duplicates implicitly. |
+| Lua state ownership | Keep one VM per HTTP service and one coroutine per invocation; serialize VM access on its event-loop thread. Stateful actors, if accepted, get distinct per-object VMs rather than sharing service globals. |
+| Async bridge | Retain typed host-operation descriptors, one resume per completion, cancellation cleanup, and request-local handles. No KJ/V8/JSG pointer crosses into Lua; no promise object is exposed. |
+| Errors and observability | Preserve source-aware Lua errors. `pcall` can catch host errors; uncaught errors fail the request and are logged. Child spans/logs/metrics are request-scoped and torn down on success, error, or cancellation. |
+| Compatibility and rollout | Keep `--experimental`; do not reuse JS compatibility dates/flags. If Lua APIs need stable evolution, introduce a Lua-specific `luaApiVersion` only when there is a demonstrated breaking-change need; otherwise additive APIs remain the default. |
+| Tests/build | Maintain the runtime/server/I/O test split: Lua value and coroutine tests, service-link/config tests, host cancellation/admission/tracing tests, then relevant Bazel build/test and formatting checks. A passing standalone test does not establish Cloudflare provider wiring. |
 
 This proposal does not imply all 20 capabilities should be implemented. Order work by use case and prerequisite, not by the JSG list:
 
 1. **Settle the shared async/resource contract:** yielding host calls, handle ownership, cancellation, error mapping, and policy hooks. Verify provider-specific request/KV admission and observer/metrics injection separately.
 2. **Design bounded data bindings:** Analytics Engine, memory cache, and narrow Cache/R2 operations. Agree on binary values, metadata tables, limits, and list cursors. Cache/R2 operations that return streams wait for the response-streaming decision.
+3. **Design networking and integrations together:** host-mediated sockets first; then Hyperdrive as a restricted destination using the same opaque stream contract. No raw networking.
+4. **Design additive event variants:** scheduled and queue consumers; WebSocket as a separate HTTP result variant. Specify completion, retry, concurrency, and cancellation as a family.
+5. **Make explicit lifecycle/security decisions:** actors and actor state first, then SQL and any actor-backed container model. Decide resource accounting before creating per-object Lua states.
+6. **Restrict dynamic capabilities:** predeclared Worker Loader names and root-scoped webfs only; arbitrary source loading or ambient filesystem/network access requires separate approval.
+7. **Keep non-goals explicit:** sync-KV stays out unless a local nonblocking use case is demonstrated.
+
+For every implementation, add a Lua API test, host-adapter test, server configuration/routing test, cancellation/limit test, and tracing/accounting test. Standalone unrestricted/no-op policy tests do not establish production enforcement.
+
+## Implementation order
+
+This proposal does not imply all 20 capabilities should be implemented. Order work by use case and prerequisite, not by the JSG list:
+
+1. **Extend the shared async/resource contract:** request-scoped coroutine-yielding host calls, producer backpressure, ownership, cancellation, and catchable errors are implemented for the current HTTP surface. Verify provider-specific request/KV admission and observer/metrics injection separately.
+2. **Design bounded data bindings:** Analytics Engine, memory cache, and narrow Cache/R2 operations. Agree on binary values, metadata tables, limits, and list cursors. Operations that return streams need the response-streaming decision only if they change the handler response contract; outbound request/response streams remain distinct.
 3. **Design networking and integrations together:** host-mediated sockets first; then Hyperdrive as a restricted destination using the same opaque stream contract. No raw networking.
 4. **Design additive event variants:** scheduled and queue consumers; WebSocket as a separate HTTP result variant. Specify completion, retry, concurrency, and cancellation as a family.
 5. **Make explicit lifecycle/security decisions:** actors and actor state first, then SQL and any actor-backed container model. Decide resource accounting before creating per-object Lua states.

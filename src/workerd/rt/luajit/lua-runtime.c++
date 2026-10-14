@@ -128,6 +128,18 @@ function workerd.createKvNamespace(kvBindingIndex)
   }
 end
 
+function workerd._makeBodyProducer(producer)
+  if type(producer) ~= "function" then
+    error("request body producer must be a function", 2)
+  end
+  return function()
+    while true do
+      local chunk = producer()
+      coroutine.yield({ operation = "bodyProducerChunk", chunk = chunk })
+    end
+  end
+end
+
 function workerd.fetch(request)
   if type(request) ~= "table" then
     error("workerd.fetch() requires a request table", 2)
@@ -888,64 +900,32 @@ kj::String readRequestBodyStreamId(lua_State* state, int tableIndex) {
   return readBodyRequestId(state, tableIndex);
 }
 
+class LuaRequestContext;
+
+kj::Promise<int> resumeLuaCoroutine(lua_State* coroutine,
+    int status,
+    kj::Rc<LuaRequestContext> requestContext,
+    bool allowProducerChunkYield = false);
+
 class LuaFunctionRequestBodyProducer final: public LuaRequestBodyProducer {
  public:
-  LuaFunctionRequestBodyProducer(lua_State* state, int functionRef)
-      : functionRef(functionRef),
-        producerCoroutine(lua_newthread(state)),
-        coroutineRef(luaL_ref(state, LUA_REGISTRYINDEX)) {}
+  LuaFunctionRequestBodyProducer(
+      lua_State* state, int functionRef, kj::Rc<LuaRequestContext> requestContext);
+  ~LuaFunctionRequestBodyProducer() noexcept(false) override;
 
-  ~LuaFunctionRequestBodyProducer() noexcept(false) override {
-    luaL_unref(producerCoroutine, LUA_REGISTRYINDEX, functionRef);
-    luaL_unref(producerCoroutine, LUA_REGISTRYINDEX, coroutineRef);
-  }
-
-  kj::Promise<kj::Maybe<kj::Array<kj::byte>>> nextChunk() override {
-    if (reachedEof) return kj::Maybe<kj::Array<kj::byte>>(kj::none);
-    lua_settop(producerCoroutine, 0);
-    lua_rawgeti(producerCoroutine, LUA_REGISTRYINDEX, functionRef);
-    auto status = lua_pcall(producerCoroutine, 0, 1, 0);
-    if (status != 0) {
-      auto message = readLuaErrorMessage(producerCoroutine);
-      lua_settop(producerCoroutine, 0);
-      KJ_FAIL_REQUIRE("LuaJIT request body producer failed:", message);
-    }
-
-    if (lua_isnil(producerCoroutine, -1)) {
-      reachedEof = true;
-      lua_settop(producerCoroutine, 0);
-      return kj::Maybe<kj::Array<kj::byte>>(kj::none);
-    }
-    if (lua_type(producerCoroutine, -1) != LUA_TSTRING) {
-      lua_settop(producerCoroutine, 0);
-      KJ_FAIL_REQUIRE("LuaJIT request body producer must return a string or nil");
-    }
-
-    size_t length = 0;
-    const char* bytes = lua_tolstring(producerCoroutine, -1, &length);
-    if (length > LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES) {
-      lua_settop(producerCoroutine, 0);
-      KJ_FAIL_REQUIRE("LuaJIT request body producer chunk exceeds limit",
-          LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES);
-    }
-    if (length > LuaRuntime::MAX_HTTP_BODY_BYTES - bytesGenerated) {
-      lua_settop(producerCoroutine, 0);
-      KJ_FAIL_REQUIRE("LuaJIT request body producer exceeds total upload limit",
-          LuaRuntime::MAX_HTTP_BODY_BYTES);
-    }
-    bytesGenerated += length;
-    auto result = kj::heapArray<kj::byte>(length);
-    if (length > 0) std::memcpy(result.begin(), bytes, length);
-    lua_settop(producerCoroutine, 0);
-    return kj::Maybe<kj::Array<kj::byte>>(kj::mv(result));
-  }
+  kj::Promise<kj::Maybe<kj::Array<kj::byte>>> nextChunk() override;
 
  private:
-  int functionRef;
+  lua_State* state;
   lua_State* producerCoroutine;
+  int functionRef;
   int coroutineRef;
+  kj::Rc<LuaRequestContext> requestContext;
   size_t bytesGenerated = 0;
+  bool started = false;
   bool reachedEof = false;
+  bool pending = false;
+  bool failed = false;
 };
 
 kj::Maybe<size_t> readOptionalServiceBindingIndex(lua_State* state, int descriptorIndex) {
@@ -965,8 +945,11 @@ kj::Maybe<size_t> readOptionalServiceBindingIndex(lua_State* state, int descript
   return static_cast<size_t>(index - 1);
 }
 
-LuaHttpRequest readFetchRequest(
-    lua_State* state, int tableIndex, kj::Maybe<size_t> serviceBindingIndex = kj::none) {
+LuaHttpRequest readFetchRequest(lua_State* state,
+    int tableIndex,
+    kj::Maybe<size_t> serviceBindingIndex,
+    kj::Rc<LuaRequestContext> requestContext,
+    int bodyProducerWrapperRef) {
   tableIndex = absoluteIndex(state, tableIndex);
   KJ_REQUIRE(lua_istable(state, tableIndex), "workerd.fetch() request must be a table");
 
@@ -1000,9 +983,15 @@ LuaHttpRequest readFetchRequest(
     } else if (lua_istable(state, -1)) {
       bodyStreamRequestId = readRequestBodyStreamId(state, absoluteIndex(state, -1));
     } else if (lua_isfunction(state, -1)) {
-      lua_pushvalue(state, -1);
+      int producerIndex = absoluteIndex(state, -1);
+      lua_rawgeti(state, LUA_REGISTRYINDEX, bodyProducerWrapperRef);
+      lua_pushvalue(state, producerIndex);
+      int wrapperStatus = lua_pcall(state, 1, 1, 0);
+      KJ_REQUIRE(wrapperStatus == 0,
+          "could not create LuaJIT request body producer:", readLuaErrorMessage(state));
       int functionRef = luaL_ref(state, LUA_REGISTRYINDEX);
-      bodyProducer = kj::heap<LuaFunctionRequestBodyProducer>(state, functionRef);
+      bodyProducer =
+          kj::heap<LuaFunctionRequestBodyProducer>(state, functionRef, kj::mv(requestContext));
     } else {
       KJ_FAIL_REQUIRE(
           "workerd.fetch() request body must be a string, request body stream, producer function, or nil");
@@ -1044,6 +1033,8 @@ struct LuaRandomBytesRequest {
 };
 
 struct LuaRandomUuidRequest {};
+
+struct LuaProducerChunkYield {};
 
 struct LuaKvGetRequest {
   size_t bindingIndex;
@@ -1295,18 +1286,21 @@ LuaBodyReadRequest readBodyReadRequest(lua_State* state) {
   };
 }
 
-kj::OneOf<kj::Duration,
+using LuaHostOperation = kj::OneOf<kj::Duration,
     LuaHttpRequest,
     LuaBodyReadRequest,
     LuaBodyCancelRequest,
     LuaRequestBodyReadRequest,
     LuaRandomBytesRequest,
     LuaRandomUuidRequest,
+    LuaProducerChunkYield,
     LuaKvGetRequest,
     LuaKvPutRequest,
     LuaKvDeleteRequest,
-    LuaKvListRequest>
-readHostOperation(lua_State* state) {
+    LuaKvListRequest>;
+
+LuaHostOperation readHostOperation(
+    lua_State* state, kj::Rc<LuaRequestContext> requestContext, int bodyProducerWrapperRef) {
   KJ_REQUIRE(lua_gettop(state) == 1, "LuaJIT host operation must yield one descriptor");
   KJ_REQUIRE(lua_istable(state, -1), "LuaJIT host operation descriptor must be a table");
   getRawField(state, -1, "operation");
@@ -1318,6 +1312,7 @@ readHostOperation(lua_State* state) {
 
   if (name == "sleep") return readSleepDelay(state);
   if (name == "randomUUID") return LuaRandomUuidRequest{};
+  if (name == "bodyProducerChunk") return LuaProducerChunkYield{};
   if (name == "randomBytes") {
     int descriptorIndex = absoluteIndex(state, -1);
     getRawField(state, descriptorIndex, "size");
@@ -1335,7 +1330,8 @@ readHostOperation(lua_State* state) {
     int descriptorIndex = absoluteIndex(state, -1);
     auto serviceBindingIndex = readOptionalServiceBindingIndex(state, descriptorIndex);
     getRawField(state, descriptorIndex, "request");
-    auto request = readFetchRequest(state, -1, kj::mv(serviceBindingIndex));
+    auto request = readFetchRequest(
+        state, -1, kj::mv(serviceBindingIndex), kj::mv(requestContext), bodyProducerWrapperRef);
     lua_pop(state, 1);
     return kj::mv(request);
   }
@@ -1433,6 +1429,281 @@ void pushHttpResponse(lua_State* state,
   lua_setfield(state, -2, "body");
 }
 
+class LuaRequestContext final: public kj::Refcounted {
+ public:
+  LuaRequestContext(kj::Timer& timer,
+      kj::Maybe<kj::Ptr<LuaHostOperations>> hostOperations,
+      LuaRequestBodyMode requestBodyMode,
+      kj::String requestId,
+      int bodyProducerWrapperRef)
+      : timer(timer),
+        hostOperations(kj::mv(hostOperations)),
+        requestBodyMode(requestBodyMode),
+        requestId(kj::mv(requestId)),
+        bodyProducerWrapperRef(bodyProducerWrapperRef) {}
+
+  kj::Promise<void> execute(lua_State* coroutine, LuaHostOperation operation);
+
+  kj::Timer& timer;
+  kj::Maybe<kj::Ptr<LuaHostOperations>> hostOperations;
+  LuaRequestBodyMode requestBodyMode;
+  kj::String requestId;
+  int bodyProducerWrapperRef;
+  kj::Vector<kj::Own<kj::AsyncInputStream>> responseBodies;
+};
+
+kj::Promise<int> resumeLuaCoroutine(lua_State* coroutine,
+    int status,
+    kj::Rc<LuaRequestContext> requestContext,
+    bool allowProducerChunkYield) {
+  while (status == LUA_YIELD) {
+    try {
+      auto operation = readHostOperation(
+          coroutine, requestContext.addRef(), requestContext->bodyProducerWrapperRef);
+      if (operation.is<LuaProducerChunkYield>()) {
+        KJ_REQUIRE(
+            allowProducerChunkYield, "LuaJIT producer chunk yielded outside a body producer");
+        co_return status;
+      }
+      lua_settop(coroutine, 0);
+      lua_pushboolean(coroutine, 1);
+      co_await requestContext->execute(coroutine, kj::mv(operation));
+    } catch (const kj::Exception& exception) {
+      lua_settop(coroutine, 0);
+      auto description = exception.getDescription();
+      lua_pushboolean(coroutine, 0);
+      lua_pushlstring(coroutine, description.begin(), description.size());
+    }
+    status = lua_resume(coroutine, 2);
+  }
+  co_return status;
+}
+
+kj::Promise<void> LuaRequestContext::execute(lua_State* coroutine, LuaHostOperation operation) {
+  KJ_SWITCH_ONEOF(operation) {
+    KJ_CASE_ONEOF(delay, kj::Duration) {
+      co_await timer.afterDelay(delay);
+      lua_pushboolean(coroutine, 1);
+    }
+    KJ_CASE_ONEOF(producerChunk, LuaProducerChunkYield) {
+      KJ_FAIL_ASSERT("LuaJIT body producer yield reached host-operation dispatcher");
+    }
+    KJ_CASE_ONEOF(randomUuid, LuaRandomUuidRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        auto uuid = host->generateRandomUuid();
+        lua_pushlstring(coroutine, uuid.begin(), uuid.size());
+      } else {
+        KJ_FAIL_REQUIRE("workerd.randomUUID() requires host operations");
+      }
+    }
+    KJ_CASE_ONEOF(randomBytes, LuaRandomBytesRequest) {
+      auto bytes = kj::heapArray<kj::byte>(randomBytes.size);
+      KJ_IF_SOME(host, hostOperations) {
+        host->fillRandomBytes(bytes);
+      } else {
+        KJ_FAIL_REQUIRE("workerd.randomBytes() requires host operations");
+      }
+      if (bytes.size() == 0) {
+        lua_pushlstring(coroutine, "", 0);
+      } else {
+        lua_pushlstring(coroutine, reinterpret_cast<const char*>(bytes.begin()), bytes.size());
+      }
+    }
+    KJ_CASE_ONEOF(request, LuaHttpRequest) {
+      KJ_IF_SOME(bodyStreamRequestId, request.bodyStreamRequestId) {
+        KJ_REQUIRE(requestBodyMode == LuaRequestBodyMode::STREAMING,
+            "workerd.fetch() request body streams require luaRequestBodyStreaming");
+        KJ_REQUIRE(bodyStreamRequestId == requestId,
+            "workerd.fetch() cannot use a body stream from another request");
+      }
+      KJ_IF_SOME(host, hostOperations) {
+        auto response = co_await host->fetch(kj::mv(request));
+        pushHttpResponse(coroutine, kj::mv(response), responseBodies, requestId);
+      } else {
+        KJ_FAIL_REQUIRE("workerd.fetch() is unavailable in this context");
+      }
+    }
+    KJ_CASE_ONEOF(kvGet, LuaKvGetRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        auto response = co_await host->kvGet(
+            kvGet.bindingIndex, kj::mv(kvGet.key), kj::mv(kvGet.options), kvGet.mode);
+        kj::Maybe<kj::Array<kj::byte>> value;
+        KJ_IF_SOME(body, response.body) {
+          value = co_await readLuaKvResponseBody(kj::mv(body));
+        }
+        if (kvGet.mode == LuaKvGetMode::WITH_METADATA) {
+          lua_createtable(coroutine, 0, 3);
+          int resultIndex = absoluteIndex(coroutine, -1);
+          lua_pushstring(coroutine, "value");
+          KJ_IF_SOME(bytes, value) {
+            const char* data =
+                bytes.size() == 0 ? "" : reinterpret_cast<const char*>(bytes.begin());
+            lua_pushlstring(coroutine, data, bytes.size());
+          } else {
+            pushWorkerdNull(coroutine);
+          }
+          lua_rawset(coroutine, resultIndex);
+          lua_pushstring(coroutine, "metadata");
+          KJ_IF_SOME(metadata, response.metadata) {
+            pushJsonText(coroutine, metadata);
+          } else {
+            pushWorkerdNull(coroutine);
+          }
+          lua_rawset(coroutine, resultIndex);
+          lua_pushstring(coroutine, "cacheStatus");
+          KJ_IF_SOME(cacheStatus, response.cacheStatus) {
+            lua_pushlstring(coroutine, cacheStatus.begin(), cacheStatus.size());
+          } else {
+            pushWorkerdNull(coroutine);
+          }
+          lua_rawset(coroutine, resultIndex);
+        } else {
+          KJ_IF_SOME(bytes, value) {
+            const char* data =
+                bytes.size() == 0 ? "" : reinterpret_cast<const char*>(bytes.begin());
+            lua_pushlstring(coroutine, data, bytes.size());
+          } else {
+            lua_pushnil(coroutine);
+          }
+        }
+      } else {
+        KJ_FAIL_REQUIRE("workerd.bindings KV get() is unavailable in this context");
+      }
+    }
+    KJ_CASE_ONEOF(kvPut, LuaKvPutRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        co_await host->kvPut(
+            kvPut.bindingIndex, kj::mv(kvPut.key), kj::mv(kvPut.value), kj::mv(kvPut.options));
+        lua_pushnil(coroutine);
+      } else {
+        KJ_FAIL_REQUIRE("workerd.bindings KV put() is unavailable in this context");
+      }
+    }
+    KJ_CASE_ONEOF(kvDelete, LuaKvDeleteRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        co_await host->kvDelete(kvDelete.bindingIndex, kj::mv(kvDelete.key));
+        lua_pushnil(coroutine);
+      } else {
+        KJ_FAIL_REQUIRE("workerd.bindings KV delete() is unavailable in this context");
+      }
+    }
+    KJ_CASE_ONEOF(kvList, LuaKvListRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        auto response = co_await host->kvList(kvList.bindingIndex, kj::mv(kvList.options));
+        auto cacheStatus = kj::mv(response.cacheStatus);
+        auto value = co_await readLuaKvResponseBody(kj::mv(response.body));
+        const char* bytes = value.size() == 0 ? "" : reinterpret_cast<const char*>(value.begin());
+        pushLuaKvListResult(coroutine, kj::StringPtr(bytes, value.size()), kj::mv(cacheStatus));
+      } else {
+        KJ_FAIL_REQUIRE("workerd.bindings KV list() is unavailable in this context");
+      }
+    }
+    KJ_CASE_ONEOF(cancelRequest, LuaBodyCancelRequest) {
+      KJ_REQUIRE(cancelRequest.requestId == requestId,
+          "workerd.cancelBody() cannot use a stream from another request");
+      KJ_REQUIRE(cancelRequest.streamId <= responseBodies.size(),
+          "workerd.cancelBody() references an unknown response body stream",
+          cancelRequest.streamId);
+      responseBodies[cancelRequest.streamId - 1] = nullptr;
+      lua_pushboolean(coroutine, 1);
+    }
+    KJ_CASE_ONEOF(readRequest, LuaBodyReadRequest) {
+      KJ_REQUIRE(readRequest.requestId == requestId,
+          "workerd.readBody() cannot use a stream from another request");
+      KJ_REQUIRE(readRequest.streamId <= responseBodies.size(),
+          "workerd.readBody() references an unknown response body stream", readRequest.streamId);
+      auto& responseBody = responseBodies[readRequest.streamId - 1];
+      if (responseBody.get() == nullptr) {
+        lua_pushnil(coroutine);
+      } else {
+        auto chunk = kj::heapArray<kj::byte>(readRequest.maxBytes);
+        auto bytesRead = co_await responseBody->tryRead(chunk.begin(), 1, chunk.size());
+        if (bytesRead == 0) {
+          responseBody = nullptr;
+          lua_pushnil(coroutine);
+        } else {
+          lua_pushlstring(coroutine, reinterpret_cast<const char*>(chunk.begin()), bytesRead);
+        }
+      }
+    }
+    KJ_CASE_ONEOF(readRequestBody, LuaRequestBodyReadRequest) {
+      KJ_REQUIRE(readRequestBody.requestId == requestId,
+          "workerd.readRequestBody() cannot use a stream from another request");
+      KJ_IF_SOME(host, hostOperations) {
+        KJ_IF_SOME(chunk, co_await host->readRequestBody(readRequestBody.maxBytes)) {
+          lua_pushlstring(coroutine, reinterpret_cast<const char*>(chunk.begin()), chunk.size());
+        } else {
+          lua_pushnil(coroutine);
+        }
+      } else {
+        KJ_FAIL_REQUIRE("workerd.readRequestBody() is unavailable in this context");
+      }
+    }
+  }
+}
+
+LuaFunctionRequestBodyProducer::LuaFunctionRequestBodyProducer(
+    lua_State* state, int functionRef, kj::Rc<LuaRequestContext> requestContext)
+    : state(state),
+      producerCoroutine(lua_newthread(state)),
+      functionRef(functionRef),
+      coroutineRef(luaL_ref(state, LUA_REGISTRYINDEX)),
+      requestContext(kj::mv(requestContext)) {}
+
+LuaFunctionRequestBodyProducer::~LuaFunctionRequestBodyProducer() noexcept(false) {
+  luaL_unref(state, LUA_REGISTRYINDEX, functionRef);
+  luaL_unref(state, LUA_REGISTRYINDEX, coroutineRef);
+}
+
+kj::Promise<kj::Maybe<kj::Array<kj::byte>>> LuaFunctionRequestBodyProducer::nextChunk() {
+  KJ_REQUIRE(!failed, "LuaJIT request body producer was cancelled or failed");
+  KJ_REQUIRE(!pending, "LuaJIT request body producer cannot run concurrently");
+  if (reachedEof) co_return kj::none;
+
+  pending = true;
+  bool completed = false;
+  KJ_DEFER({
+    pending = false;
+    if (!completed) failed = true;
+  });
+
+  LuaStackGuard parentStackGuard(state);
+  lua_settop(producerCoroutine, 0);
+  LuaStackGuard coroutineStackGuard(producerCoroutine);
+  if (!started) {
+    lua_rawgeti(producerCoroutine, LUA_REGISTRYINDEX, functionRef);
+    started = true;
+  }
+
+  auto status = lua_resume(producerCoroutine, 0);
+  status = co_await resumeLuaCoroutine(producerCoroutine, status, requestContext.addRef(), true);
+  KJ_REQUIRE(status == LUA_YIELD,
+      "LuaJIT request body producer failed:", readLuaErrorMessage(producerCoroutine));
+  KJ_REQUIRE(lua_gettop(producerCoroutine) == 1 && lua_istable(producerCoroutine, -1),
+      "LuaJIT request body producer did not yield a chunk");
+
+  getRawField(producerCoroutine, -1, "chunk");
+  if (lua_isnil(producerCoroutine, -1)) {
+    reachedEof = true;
+    completed = true;
+    co_return kj::none;
+  }
+  KJ_REQUIRE(lua_type(producerCoroutine, -1) == LUA_TSTRING,
+      "LuaJIT request body producer must return a string or nil");
+
+  size_t length = 0;
+  const char* bytes = lua_tolstring(producerCoroutine, -1, &length);
+  KJ_REQUIRE(length <= LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES,
+      "LuaJIT request body producer chunk exceeds limit", LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES);
+  KJ_REQUIRE(length <= LuaRuntime::MAX_HTTP_BODY_BYTES - bytesGenerated,
+      "LuaJIT request body producer exceeds total upload limit", LuaRuntime::MAX_HTTP_BODY_BYTES);
+  bytesGenerated += length;
+  auto result = kj::heapArray<kj::byte>(length);
+  if (length > 0) std::memcpy(result.begin(), bytes, length);
+  completed = true;
+  co_return kj::Maybe<kj::Array<kj::byte>>(kj::mv(result));
+}
+
 }  // namespace
 
 LuaHmacKey::LuaHmacKey(
@@ -1463,7 +1734,8 @@ kj::ArrayPtr<const LuaHmacKeyUsage> LuaHmacKey::getUsages() const {
 LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<LuaBinding> bindings)
     : timer(timer),
       state(luaL_newstate()),
-      fetchHandlerRef(LUA_NOREF) {
+      fetchHandlerRef(LUA_NOREF),
+      bodyProducerWrapperRef(LUA_NOREF) {
   KJ_REQUIRE(state != nullptr, "could not create LuaJIT state");
   bool keepState = false;
   KJ_DEFER(if (!keepState) lua_close(state));
@@ -1478,6 +1750,13 @@ LuaRuntime::LuaRuntime(kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<L
   int asyncApiEvaluationStatus = lua_pcall(state, 0, 0, 0);
   KJ_REQUIRE(asyncApiEvaluationStatus == 0,
       "failed to evaluate LuaJIT async API:", readLuaErrorMessage(state));
+  lua_getglobal(state, "workerd");
+  getRawField(state, -1, "_makeBodyProducer");
+  KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT async API is missing its body producer wrapper");
+  bodyProducerWrapperRef = luaL_ref(state, LUA_REGISTRYINDEX);
+  lua_pushnil(state);
+  lua_setfield(state, -2, "_makeBodyProducer");
+  lua_pop(state, 1);
   pushLuaBindings(state, bindings.asPtr());
   lua_getglobal(state, "workerd");
   lua_pushcfunction(state, parseUrl);
@@ -1568,181 +1847,10 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
     }
   }
 
-  kj::Vector<kj::Own<kj::AsyncInputStream>> responseBodies;
+  auto requestContext = kj::rc<LuaRequestContext>(
+      timer, kj::mv(hostOperations), requestBodyMode, kj::str(requestId), bodyProducerWrapperRef);
   int status = lua_resume(coroutine, 1);
-  while (status == LUA_YIELD) {
-    try {
-      auto operation = readHostOperation(coroutine);
-      lua_settop(coroutine, 0);
-      lua_pushboolean(coroutine, 1);
-      KJ_SWITCH_ONEOF(operation) {
-        KJ_CASE_ONEOF(delay, kj::Duration) {
-          co_await timer.afterDelay(delay);
-          lua_pushboolean(coroutine, 1);
-        }
-        KJ_CASE_ONEOF(randomUuid, LuaRandomUuidRequest) {
-          KJ_IF_SOME(host, hostOperations) {
-            auto uuid = host->generateRandomUuid();
-            lua_pushlstring(coroutine, uuid.begin(), uuid.size());
-          } else {
-            KJ_FAIL_REQUIRE("workerd.randomUUID() requires host operations");
-          }
-        }
-        KJ_CASE_ONEOF(randomBytes, LuaRandomBytesRequest) {
-          auto bytes = kj::heapArray<kj::byte>(randomBytes.size);
-          KJ_IF_SOME(host, hostOperations) {
-            host->fillRandomBytes(bytes);
-          } else {
-            KJ_FAIL_REQUIRE("workerd.randomBytes() requires host operations");
-          }
-          if (bytes.size() == 0) {
-            lua_pushlstring(coroutine, "", 0);
-          } else {
-            lua_pushlstring(coroutine, reinterpret_cast<const char*>(bytes.begin()), bytes.size());
-          }
-        }
-        KJ_CASE_ONEOF(request, LuaHttpRequest) {
-          KJ_IF_SOME(bodyStreamRequestId, request.bodyStreamRequestId) {
-            KJ_REQUIRE(requestBodyMode == LuaRequestBodyMode::STREAMING,
-                "workerd.fetch() request body streams require luaRequestBodyStreaming");
-            KJ_REQUIRE(bodyStreamRequestId == requestId,
-                "workerd.fetch() cannot use a body stream from another request");
-          }
-          KJ_IF_SOME(host, hostOperations) {
-            auto response = co_await host->fetch(kj::mv(request));
-            pushHttpResponse(coroutine, kj::mv(response), responseBodies, requestId);
-          } else {
-            KJ_FAIL_REQUIRE("workerd.fetch() is unavailable in this context");
-          }
-        }
-        KJ_CASE_ONEOF(kvGet, LuaKvGetRequest) {
-          KJ_IF_SOME(host, hostOperations) {
-            auto response = co_await host->kvGet(
-                kvGet.bindingIndex, kj::mv(kvGet.key), kj::mv(kvGet.options), kvGet.mode);
-            kj::Maybe<kj::Array<kj::byte>> value;
-            KJ_IF_SOME(body, response.body) {
-              value = co_await readLuaKvResponseBody(kj::mv(body));
-            }
-            if (kvGet.mode == LuaKvGetMode::WITH_METADATA) {
-              lua_createtable(coroutine, 0, 3);
-              int resultIndex = absoluteIndex(coroutine, -1);
-              lua_pushstring(coroutine, "value");
-              KJ_IF_SOME(bytes, value) {
-                const char* data =
-                    bytes.size() == 0 ? "" : reinterpret_cast<const char*>(bytes.begin());
-                lua_pushlstring(coroutine, data, bytes.size());
-              } else {
-                pushWorkerdNull(coroutine);
-              }
-              lua_rawset(coroutine, resultIndex);
-              lua_pushstring(coroutine, "metadata");
-              KJ_IF_SOME(metadata, response.metadata) {
-                pushJsonText(coroutine, metadata);
-              } else {
-                pushWorkerdNull(coroutine);
-              }
-              lua_rawset(coroutine, resultIndex);
-              lua_pushstring(coroutine, "cacheStatus");
-              KJ_IF_SOME(cacheStatus, response.cacheStatus) {
-                lua_pushlstring(coroutine, cacheStatus.begin(), cacheStatus.size());
-              } else {
-                pushWorkerdNull(coroutine);
-              }
-              lua_rawset(coroutine, resultIndex);
-            } else {
-              KJ_IF_SOME(bytes, value) {
-                const char* data =
-                    bytes.size() == 0 ? "" : reinterpret_cast<const char*>(bytes.begin());
-                lua_pushlstring(coroutine, data, bytes.size());
-              } else {
-                lua_pushnil(coroutine);
-              }
-            }
-          } else {
-            KJ_FAIL_REQUIRE("workerd.bindings KV get() is unavailable in this context");
-          }
-        }
-        KJ_CASE_ONEOF(kvPut, LuaKvPutRequest) {
-          KJ_IF_SOME(host, hostOperations) {
-            co_await host->kvPut(
-                kvPut.bindingIndex, kj::mv(kvPut.key), kj::mv(kvPut.value), kj::mv(kvPut.options));
-            lua_pushnil(coroutine);
-          } else {
-            KJ_FAIL_REQUIRE("workerd.bindings KV put() is unavailable in this context");
-          }
-        }
-        KJ_CASE_ONEOF(kvDelete, LuaKvDeleteRequest) {
-          KJ_IF_SOME(host, hostOperations) {
-            co_await host->kvDelete(kvDelete.bindingIndex, kj::mv(kvDelete.key));
-            lua_pushnil(coroutine);
-          } else {
-            KJ_FAIL_REQUIRE("workerd.bindings KV delete() is unavailable in this context");
-          }
-        }
-        KJ_CASE_ONEOF(kvList, LuaKvListRequest) {
-          KJ_IF_SOME(host, hostOperations) {
-            auto response = co_await host->kvList(kvList.bindingIndex, kj::mv(kvList.options));
-            auto cacheStatus = kj::mv(response.cacheStatus);
-            auto value = co_await readLuaKvResponseBody(kj::mv(response.body));
-            const char* bytes =
-                value.size() == 0 ? "" : reinterpret_cast<const char*>(value.begin());
-            pushLuaKvListResult(coroutine, kj::StringPtr(bytes, value.size()), kj::mv(cacheStatus));
-          } else {
-            KJ_FAIL_REQUIRE("workerd.bindings KV list() is unavailable in this context");
-          }
-        }
-        KJ_CASE_ONEOF(cancelRequest, LuaBodyCancelRequest) {
-          KJ_REQUIRE(cancelRequest.requestId == requestId,
-              "workerd.cancelBody() cannot use a stream from another request");
-          KJ_REQUIRE(cancelRequest.streamId <= responseBodies.size(),
-              "workerd.cancelBody() references an unknown response body stream",
-              cancelRequest.streamId);
-          responseBodies[cancelRequest.streamId - 1] = nullptr;
-          lua_pushboolean(coroutine, 1);
-        }
-        KJ_CASE_ONEOF(readRequest, LuaBodyReadRequest) {
-          KJ_REQUIRE(readRequest.requestId == requestId,
-              "workerd.readBody() cannot use a stream from another request");
-          KJ_REQUIRE(readRequest.streamId <= responseBodies.size(),
-              "workerd.readBody() references an unknown response body stream",
-              readRequest.streamId);
-          auto& responseBody = responseBodies[readRequest.streamId - 1];
-          if (responseBody.get() == nullptr) {
-            lua_pushnil(coroutine);
-          } else {
-            auto chunk = kj::heapArray<kj::byte>(readRequest.maxBytes);
-            auto bytesRead = co_await responseBody->tryRead(chunk.begin(), 1, chunk.size());
-            if (bytesRead == 0) {
-              responseBody = nullptr;
-              lua_pushnil(coroutine);
-            } else {
-              lua_pushlstring(coroutine, reinterpret_cast<const char*>(chunk.begin()), bytesRead);
-            }
-          }
-        }
-        KJ_CASE_ONEOF(readRequestBody, LuaRequestBodyReadRequest) {
-          KJ_REQUIRE(readRequestBody.requestId == requestId,
-              "workerd.readRequestBody() cannot use a stream from another request");
-          KJ_IF_SOME(host, hostOperations) {
-            KJ_IF_SOME(chunk, co_await host->readRequestBody(readRequestBody.maxBytes)) {
-              lua_pushlstring(
-                  coroutine, reinterpret_cast<const char*>(chunk.begin()), chunk.size());
-            } else {
-              lua_pushnil(coroutine);
-            }
-          } else {
-            KJ_FAIL_REQUIRE("workerd.readRequestBody() is unavailable in this context");
-          }
-        }
-      }
-    } catch (const kj::Exception& exception) {
-      lua_settop(coroutine, 0);
-      auto description = exception.getDescription();
-      lua_pushboolean(coroutine, 0);
-      lua_pushlstring(coroutine, description.begin(), description.size());
-    }
-    status = lua_resume(coroutine, 2);
-  }
+  status = co_await resumeLuaCoroutine(coroutine, status, requestContext.addRef());
   KJ_REQUIRE(status == 0, "LuaJIT fetch() failed:", readLuaErrorMessage(coroutine));
   KJ_REQUIRE(lua_istable(coroutine, -1), "LuaJIT fetch() must return a response table");
   int responseIndex = absoluteIndex(coroutine, -1);

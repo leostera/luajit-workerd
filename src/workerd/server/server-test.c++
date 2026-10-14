@@ -1113,12 +1113,12 @@ KJ_TEST("Server: LuaJIT KV list preserves configured routing and result fields")
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*false:test:1:next:HIT)");
 }
 
-KJ_TEST("Server: LuaJIT streams Lua-produced outbound body chunks") {
+KJ_TEST("Server: LuaJIT body producers yield through host operations") {
   TestServer test(R"((
     services = [
       ( name = "lua",
         worker = (
-          luaScript = "return { fetch = function() local index=0; local function nextChunk() index=index+1; if index==1 then return 'abc' end; if index==2 then return 'def' end; return nil end; local x=workerd.fetch({method='POST', url='https://example.com/generated', body=nextChunk}); return {status=x.status, body=workerd.readAll(x.body)} end }",
+          luaScript = "return { fetch = function() local index=0; local function nextChunk() index=index+1; workerd.randomUUID(); if index==1 then return 'abc' end; if index==2 then return 'def' end; return nil end; local x=workerd.fetch({method='POST', url='https://example.com/generated', body=nextChunk}); return {status=x.status, body=workerd.readAll(x.body)} end }",
           globalOutbound = "custom"
         )
       ),

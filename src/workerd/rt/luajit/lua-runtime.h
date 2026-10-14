@@ -73,7 +73,8 @@ class LuaRequestBodyProducer {
  public:
   virtual ~LuaRequestBodyProducer() noexcept(false) = default;
   // The producer is tied to its LuaRuntime; hosts must consume or destroy it before fetch completes.
-  // Return one chunk or none at EOF; hosts request the next chunk after accepting the previous one.
+  // Producers run in a child Lua coroutine and may yield through request host operations. Return one
+  // chunk or none at EOF; hosts request the next chunk only after accepting the previous one.
   virtual kj::Promise<kj::Maybe<kj::Array<kj::byte>>> nextChunk() = 0;
 };
 
@@ -181,8 +182,9 @@ class LuaRuntime final {
   static constexpr size_t MAX_KV_RESPONSE_BYTES = 1024 * 1024;
 
   // The module must return a table with a callable `fetch` field. This runtime owns one LuaJIT
-  // state for its lifetime; each fetch() runs on a coroutine and yields only through host async
-  // operations. Coroutine access to the shared state is serialized on the event-loop thread.
+  // state for its lifetime; each fetch() and request-body producer runs on a coroutine and yields
+  // through host async operations. Coroutine access to the shared state stays serialized on the
+  // event-loop thread.
   // Bindings are parsed and installed before the module source is evaluated.
   LuaRuntime(
       kj::StringPtr moduleSource, kj::Timer& timer, kj::Array<LuaBinding> bindings = nullptr);
@@ -200,6 +202,7 @@ class LuaRuntime final {
   kj::Timer& timer;
   lua_State* state;
   int fetchHandlerRef;
+  int bodyProducerWrapperRef;
   uint64_t nextRequestId = 1;
 };
 

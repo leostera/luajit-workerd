@@ -379,6 +379,37 @@ class CancelableLuaHostOperations final: public LuaHostOperationsWithoutRequestB
   bool canceled = false;
 };
 
+class CancelableProducerLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
+ public:
+  kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    if (request.url == "https://example.com/pending") {
+      auto pair = kj::newPromiseAndFulfiller<LuaHttpResponse>();
+      fulfiller = kj::mv(pair.fulfiller);
+      co_return co_await kj::mv(pair.promise).attach(kj::defer([this] { cancelled = true; }));
+    }
+
+    if (request.bodyProducer != kj::none) {
+      KJ_IF_SOME(producer, request.bodyProducer) {
+        while (true) {
+          KJ_IF_SOME(chunk, co_await producer->nextChunk()) {
+            (void)chunk;
+          } else {
+            break;
+          }
+        }
+      }
+    }
+    co_return LuaHttpResponse{
+      .status = 200,
+      .headers = {},
+      .body = newMemoryInputStream("outer"_kj),
+    };
+  }
+
+  kj::Own<kj::PromiseFulfiller<LuaHttpResponse>> fulfiller;
+  bool cancelled = false;
+};
+
 class FailingLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
  public:
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
@@ -960,7 +991,14 @@ KJ_TEST("LuaJIT fetch body producers yield bounded binary chunks on demand") {
   auto io = kj::setupAsyncIo();
   constexpr kj::StringPtr source = R"lua(
     local index = 0
+    local producerCoroutine
     local function nextChunk()
+      local currentCoroutine = coroutine.running()
+      if producerCoroutine == nil then
+        producerCoroutine = currentCoroutine
+      else
+        assert(producerCoroutine == currentCoroutine, "producer coroutine changed between chunks")
+      end
       index = index + 1
       if index == 1 then return "abc" end
       if index == 2 then return string.char(0, 255) end
@@ -996,6 +1034,71 @@ KJ_TEST("LuaJIT fetch body producers yield bounded binary chunks on demand") {
   } else {
     KJ_FAIL_ASSERT("host fetch was not called");
   }
+}
+
+KJ_TEST("LuaJIT request body producers yield for host operations") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    local produced = false
+    local function nextChunk()
+      if produced then return nil end
+      produced = true
+      workerd.sleep(1)
+      local source = workerd.fetch({ url = "https://example.com/source" })
+      return workerd.readAll(source.body)
+    end
+    return {
+      fetch = function()
+        local response = workerd.fetch({
+          method = "POST",
+          url = "https://example.com/upload",
+          body = nextChunk,
+        })
+        return { status = response.status, body = workerd.readAll(response.body) }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  TestLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto response = runtime.fetch("GET"_kj, "/upload"_kj, headers, nullptr, hostOperations.getPtr())
+                      .wait(io.waitScope);
+
+  KJ_EXPECT(asString(response.body) == "upstream");
+  KJ_REQUIRE(hostOperations.bodyProducerReachedEof);
+  KJ_REQUIRE(hostOperations.bodyProducerChunks.size() == 1);
+  KJ_EXPECT(asString(hostOperations.bodyProducerChunks[0]) == "upstream");
+}
+
+KJ_TEST("LuaJIT cancellation tears down an asynchronous body producer") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function()
+        local response = workerd.fetch({
+          method = "POST",
+          url = "https://example.com/upload",
+          body = function()
+            local nested = workerd.fetch({ url = "https://example.com/pending" })
+            return workerd.readAll(nested.body)
+          end,
+        })
+        return { status = response.status, body = "unexpected" }
+      end
+    }
+  )lua"_kj;
+
+  LuaRuntime runtime(source, io.provider->getTimer());
+  CancelableProducerLuaHostOperations hostOperations;
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+  auto request = runtime.fetch("GET"_kj, "/upload"_kj, headers, nullptr, hostOperations.getPtr());
+  KJ_EXPECT(!request.poll(io.waitScope));
+  KJ_REQUIRE(hostOperations.fulfiller.get() != nullptr);
+  request = nullptr;
+  KJ_EXPECT(hostOperations.cancelled);
 }
 
 KJ_TEST("LuaJIT request body producers reject oversized chunks") {
