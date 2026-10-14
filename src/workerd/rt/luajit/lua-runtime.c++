@@ -130,6 +130,34 @@ function workerd.createKvNamespace(kvBindingIndex)
   }
 end
 
+function workerd.createAiBinding(serviceBindingIndex)
+  return {
+    run = function(_, model, inputs, options)
+      if type(model) ~= "string" or model == "" then
+        error("Workers AI run() requires a model name", 2)
+      end
+      if type(inputs) ~= "table" then
+        error("Workers AI run() requires an inputs table", 2)
+      end
+      if options ~= nil and type(options) ~= "table" then
+        error("Workers AI run() options must be a table", 2)
+      end
+      local result = workerd.await({
+        operation = "aiRun",
+        serviceBindingIndex = serviceBindingIndex,
+        model = model,
+        inputs = inputs,
+        options = options,
+      })
+      if result.status < 200 or result.status >= 300 then
+        error("Workers AI request failed (" .. result.status .. "): " .. result.body, 2)
+      end
+      if result.isJson then return result.value end
+      return result.body
+    end,
+  }
+end
+
 function workerd.createD1Database(serviceBindingIndex)
   local function makeStatement(sql, params)
     local function execute(mode)
@@ -907,6 +935,17 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<LuaBinding> bindings) {
         KJ_REQUIRE(status == 0, "failed to create Lua KV binding:", readLuaErrorMessage(state));
         break;
       }
+      case LuaBinding::Type::AI: {
+        getRawField(state, -3, "createAiBinding");
+        KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT Workers AI binding factory is unavailable");
+        KJ_REQUIRE(binding.serviceBindingIndex < static_cast<size_t>(INT_MAX),
+            "too many Lua service bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(binding.serviceBindingIndex + 1));
+        int status = lua_pcall(state, 1, 1, 0);
+        KJ_REQUIRE(
+            status == 0, "failed to create Lua Workers AI binding:", readLuaErrorMessage(state));
+        break;
+      }
       case LuaBinding::Type::D1_DATABASE: {
         getRawField(state, -3, "createD1Database");
         KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT D1 binding factory is unavailable");
@@ -927,6 +966,8 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<LuaBinding> bindings) {
   lua_setfield(state, -2, "createKvNamespace");
   lua_pushnil(state);
   lua_setfield(state, -2, "createD1Database");
+  lua_pushnil(state);
+  lua_setfield(state, -2, "createAiBinding");
   lua_pop(state, 1);
 }
 
@@ -1158,9 +1199,14 @@ struct LuaD1QueryRequest {
   kj::String body;
 };
 
-void requireD1Utf8(kj::StringPtr value, kj::StringPtr context) {
-  KJ_REQUIRE(
-      simdutf::validate_utf8(value.begin(), value.size()), "D1", context, "must be valid UTF-8");
+struct LuaAiRunRequest {
+  size_t bindingIndex;
+  kj::String model;
+  kj::String body;
+};
+
+void requireValidUtf8(kj::StringPtr value, kj::StringPtr context) {
+  KJ_REQUIRE(simdutf::validate_utf8(value.begin(), value.size()), context, "must be valid UTF-8");
 }
 
 void appendJsonString(kj::Vector<char>& output, kj::StringPtr value) {
@@ -1212,6 +1258,205 @@ bool isWorkerdNullValue(lua_State* state, int index) {
   return result;
 }
 
+struct LuaJsonTableShape {
+  bool isArray;
+  size_t count;
+};
+
+LuaJsonTableShape readLuaJsonTableShape(lua_State* state, int index) {
+  index = absoluteIndex(state, index);
+  bool sawArrayKey = false;
+  bool sawObjectKey = false;
+  size_t arrayCount = 0;
+  size_t maxArrayIndex = 0;
+  size_t objectCount = 0;
+  lua_pushnil(state);
+  while (lua_next(state, index) != 0) {
+    if (lua_type(state, -2) == LUA_TNUMBER) {
+      int isNumber = 0;
+      lua_Integer key = lua_tointegerx(state, -2, &isNumber);
+      KJ_REQUIRE(isNumber && key > 0 && static_cast<lua_Number>(key) == lua_tonumber(state, -2),
+          "Workers AI JSON arrays require positive integer indices");
+      KJ_REQUIRE(static_cast<uint64_t>(key) <= LuaRuntime::MAX_AI_JSON_BYTES,
+          "Workers AI JSON array index exceeds the encoding limit");
+      sawArrayKey = true;
+      ++arrayCount;
+      maxArrayIndex = kj::max(maxArrayIndex, static_cast<size_t>(key));
+    } else if (lua_type(state, -2) == LUA_TSTRING) {
+      sawObjectKey = true;
+      ++objectCount;
+    } else {
+      lua_pop(state, 2);
+      KJ_FAIL_REQUIRE("Workers AI JSON objects require string keys");
+    }
+    KJ_REQUIRE(!(sawArrayKey && sawObjectKey),
+        "Workers AI JSON tables cannot mix array indices and object keys");
+    lua_pop(state, 1);
+  }
+  if (sawArrayKey) {
+    KJ_REQUIRE(arrayCount == maxArrayIndex,
+        "Workers AI JSON arrays must use contiguous indices starting at 1");
+    return {.isArray = true, .count = arrayCount};
+  }
+  return {.isArray = false, .count = objectCount};
+}
+
+void appendLuaAiJsonValue(lua_State* state,
+    kj::Vector<char>& output,
+    int index,
+    size_t depth,
+    kj::Vector<const void*>& parentTables);
+
+void appendLuaAiJsonTable(lua_State* state,
+    kj::Vector<char>& output,
+    int index,
+    size_t depth,
+    kj::Vector<const void*>& parentTables,
+    bool requireObject) {
+  index = absoluteIndex(state, index);
+  KJ_REQUIRE(depth < LuaRuntime::MAX_AI_JSON_DEPTH,
+      "Workers AI JSON input exceeds maximum nesting depth", LuaRuntime::MAX_AI_JSON_DEPTH);
+  const void* identity = lua_topointer(state, index);
+  for (const void* parent: parentTables) {
+    KJ_REQUIRE(parent != identity, "Workers AI JSON input cannot contain cycles");
+  }
+  parentTables.add(identity);
+  KJ_DEFER(parentTables.removeLast());
+
+  auto shape = readLuaJsonTableShape(state, index);
+  KJ_REQUIRE(
+      !requireObject || !shape.isArray, "Workers AI inputs and options must be JSON objects");
+  if (shape.isArray) {
+    output.add('[');
+    for (size_t i = 1; i <= shape.count; ++i) {
+      if (i > 1) output.add(',');
+      lua_rawgeti(state, index, static_cast<int>(i));
+      appendLuaAiJsonValue(state, output, -1, depth + 1, parentTables);
+      lua_pop(state, 1);
+    }
+    output.add(']');
+    KJ_REQUIRE(output.size() <= LuaRuntime::MAX_AI_JSON_BYTES,
+        "Workers AI request JSON exceeds limit", LuaRuntime::MAX_AI_JSON_BYTES);
+    return;
+  }
+
+  output.add('{');
+  size_t emitted = 0;
+  lua_pushnil(state);
+  while (lua_next(state, index) != 0) {
+    if (emitted++ > 0) output.add(',');
+    size_t keyLength = 0;
+    const char* key = lua_tolstring(state, -2, &keyLength);
+    kj::StringPtr keyString(key, keyLength);
+    requireValidUtf8(keyString, "JSON object key");
+    appendJsonString(output, keyString);
+    output.add(':');
+    appendLuaAiJsonValue(state, output, -1, depth + 1, parentTables);
+    lua_pop(state, 1);
+    KJ_REQUIRE(output.size() <= LuaRuntime::MAX_AI_JSON_BYTES,
+        "Workers AI request JSON exceeds limit", LuaRuntime::MAX_AI_JSON_BYTES);
+  }
+  output.add('}');
+  KJ_REQUIRE(output.size() <= LuaRuntime::MAX_AI_JSON_BYTES,
+      "Workers AI request JSON exceeds limit", LuaRuntime::MAX_AI_JSON_BYTES);
+}
+
+void appendLuaAiJsonValue(lua_State* state,
+    kj::Vector<char>& output,
+    int index,
+    size_t depth,
+    kj::Vector<const void*>& parentTables) {
+  index = absoluteIndex(state, index);
+  switch (lua_type(state, index)) {
+    case LUA_TNIL:
+      output.addAll("null"_kj.asArray());
+      break;
+    case LUA_TBOOLEAN:
+      output.addAll(lua_toboolean(state, index) ? "true"_kj.asArray() : "false"_kj.asArray());
+      break;
+    case LUA_TNUMBER: {
+      double value = lua_tonumber(state, index);
+      KJ_REQUIRE(std::isfinite(value), "Workers AI JSON numbers must be finite");
+      auto number = kj::str(value);
+      output.addAll(number.asArray());
+      break;
+    }
+    case LUA_TSTRING: {
+      size_t length = 0;
+      const char* value = lua_tolstring(state, index, &length);
+      kj::StringPtr stringValue(value, length);
+      requireValidUtf8(stringValue, "JSON string");
+      KJ_REQUIRE(length <= LuaRuntime::MAX_AI_JSON_BYTES, "Workers AI JSON string exceeds limit",
+          LuaRuntime::MAX_AI_JSON_BYTES);
+      appendJsonString(output, stringValue);
+      break;
+    }
+    case LUA_TTABLE:
+      if (isWorkerdNullValue(state, index)) {
+        output.addAll("null"_kj.asArray());
+      } else {
+        appendLuaAiJsonTable(state, output, index, depth, parentTables, false);
+      }
+      break;
+    default:
+      KJ_FAIL_REQUIRE(
+          "Workers AI JSON values support only tables, strings, numbers, booleans, and null");
+  }
+  KJ_REQUIRE(output.size() <= LuaRuntime::MAX_AI_JSON_BYTES,
+      "Workers AI request JSON exceeds limit", LuaRuntime::MAX_AI_JSON_BYTES);
+}
+
+kj::String serializeAiRunRequestBody(lua_State* state, int inputsIndex, int optionsIndex) {
+  inputsIndex = absoluteIndex(state, inputsIndex);
+  optionsIndex = absoluteIndex(state, optionsIndex);
+  KJ_REQUIRE(lua_istable(state, inputsIndex) && !isWorkerdNullValue(state, inputsIndex),
+      "Workers AI inputs must be an object table");
+  KJ_REQUIRE(lua_isnil(state, optionsIndex) ||
+          (lua_istable(state, optionsIndex) && !isWorkerdNullValue(state, optionsIndex)),
+      "Workers AI options must be an object table");
+
+  kj::Vector<char> output;
+  kj::Vector<const void*> parentTables;
+  output.addAll("{\"inputs\":"_kj.asArray());
+  appendLuaAiJsonTable(state, output, inputsIndex, 0, parentTables, true);
+  output.addAll(",\"options\":"_kj.asArray());
+  if (lua_isnil(state, optionsIndex)) {
+    output.addAll("{}"_kj.asArray());
+  } else {
+    appendLuaAiJsonTable(state, output, optionsIndex, 0, parentTables, true);
+  }
+  output.add('}');
+  KJ_REQUIRE(output.size() <= LuaRuntime::MAX_AI_JSON_BYTES,
+      "Workers AI request JSON exceeds limit", LuaRuntime::MAX_AI_JSON_BYTES);
+  return kj::heapString(output.begin(), output.size());
+}
+
+LuaAiRunRequest readAiRunRequest(lua_State* state, int descriptorIndex) {
+  descriptorIndex = absoluteIndex(state, descriptorIndex);
+  size_t bindingIndex = 0;
+  KJ_IF_SOME(index, readOptionalServiceBindingIndex(state, descriptorIndex)) {
+    bindingIndex = index;
+  } else {
+    KJ_FAIL_REQUIRE("Workers AI request requires a configured service binding");
+  }
+  auto model = readStringField(state, descriptorIndex, "model");
+  KJ_REQUIRE(model.size() > 0 && model.size() <= LuaRuntime::MAX_AI_MODEL_ID_BYTES,
+      "Workers AI model name must contain 1 through", LuaRuntime::MAX_AI_MODEL_ID_BYTES, "bytes");
+  requireValidUtf8(model, "model name");
+  getRawField(state, descriptorIndex, "inputs");
+  KJ_REQUIRE(lua_istable(state, -1), "Workers AI inputs must be an object table");
+  int inputsIndex = absoluteIndex(state, -1);
+  getRawField(state, descriptorIndex, "options");
+  int optionsIndex = absoluteIndex(state, -1);
+  auto body = serializeAiRunRequestBody(state, inputsIndex, optionsIndex);
+  lua_pop(state, 2);
+  return LuaAiRunRequest{
+    .bindingIndex = bindingIndex,
+    .model = kj::mv(model),
+    .body = kj::mv(body),
+  };
+}
+
 kj::String serializeD1RequestBody(lua_State* state, kj::StringPtr sql, int paramsIndex) {
   paramsIndex = absoluteIndex(state, paramsIndex);
   getRawField(state, paramsIndex, "n");
@@ -1224,7 +1469,7 @@ kj::String serializeD1RequestBody(lua_State* state, kj::StringPtr sql, int param
   KJ_REQUIRE(validCount, "D1 binding accepts at most", LuaRuntime::MAX_D1_BINDING_VALUES, "values");
   KJ_REQUIRE(sql.size() <= LuaRuntime::MAX_D1_SQL_BYTES, "D1 SQL exceeds limit",
       LuaRuntime::MAX_D1_SQL_BYTES);
-  requireD1Utf8(sql, "SQL text");
+  requireValidUtf8(sql, "SQL text");
 
   kj::Vector<char> output;
   output.add('{');
@@ -1246,7 +1491,7 @@ kj::String serializeD1RequestBody(lua_State* state, kj::StringPtr sql, int param
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
         auto stringValue = kj::StringPtr(value, length);
-        requireD1Utf8(stringValue, "string binding value");
+        requireValidUtf8(stringValue, "string binding value");
         appendJsonString(output, stringValue);
         break;
       }
@@ -1516,16 +1761,27 @@ kj::Promise<kj::Array<kj::byte>> readLuaKvResponseBody(kj::Own<kj::AsyncInputStr
   co_return value.releaseAsArray();
 }
 
-kj::Promise<kj::Array<kj::byte>> readLuaD1ResponseBody(kj::Own<kj::AsyncInputStream> body) {
+bool asciiCaseInsensitiveEquals(kj::StringPtr left, kj::StringPtr right) {
+  if (left.size() != right.size()) return false;
+  for (size_t i = 0; i < left.size(); ++i) {
+    char a = left[i];
+    char b = right[i];
+    if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+    if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+    if (a != b) return false;
+  }
+  return true;
+}
+
+kj::Promise<kj::Array<kj::byte>> readLuaBoundedResponseBody(
+    kj::Own<kj::AsyncInputStream> body, size_t limit, kj::StringPtr context) {
   kj::Vector<kj::byte> value;
-  while (value.size() <= LuaRuntime::MAX_D1_RESPONSE_BYTES) {
-    size_t maxBytes =
-        kj::min<size_t>(16 * 1024, LuaRuntime::MAX_D1_RESPONSE_BYTES + 1 - value.size());
+  while (value.size() <= limit) {
+    size_t maxBytes = kj::min<size_t>(16 * 1024, limit + 1 - value.size());
     auto chunk = kj::heapArray<kj::byte>(maxBytes);
     size_t bytesRead = co_await body->tryRead(chunk.begin(), 1, maxBytes);
     if (bytesRead == 0) break;
-    KJ_REQUIRE(bytesRead <= LuaRuntime::MAX_D1_RESPONSE_BYTES - value.size(),
-        "D1 response exceeds limit", LuaRuntime::MAX_D1_RESPONSE_BYTES);
+    KJ_REQUIRE(bytesRead <= limit - value.size(), context, " exceeds limit", limit);
     value.addAll(chunk.asPtr().first(bytesRead));
   }
   co_return value.releaseAsArray();
@@ -1569,7 +1825,8 @@ using LuaHostOperation = kj::OneOf<kj::Duration,
     LuaKvPutRequest,
     LuaKvDeleteRequest,
     LuaKvListRequest,
-    LuaD1QueryRequest>;
+    LuaD1QueryRequest,
+    LuaAiRunRequest>;
 
 LuaHostOperation readHostOperation(
     lua_State* state, kj::Rc<LuaRequestContext> requestContext, int bodyProducerWrapperRef) {
@@ -1641,6 +1898,9 @@ LuaHostOperation readHostOperation(
   }
   if (name == "d1Query") {
     return readD1QueryRequest(state, absoluteIndex(state, -1));
+  }
+  if (name == "aiRun") {
+    return readAiRunRequest(state, absoluteIndex(state, -1));
   }
   if (name == "readBody") return readBodyReadRequest(state);
   if (name == "readRequestBody") {
@@ -1890,7 +2150,8 @@ kj::Promise<void> LuaRequestContext::execute(lua_State* coroutine, LuaHostOperat
           .body = kj::mv(requestBody),
           .serviceBindingIndex = kj::some(static_cast<size_t>(d1Query.bindingIndex)),
         });
-        auto responseBody = co_await readLuaD1ResponseBody(kj::mv(response.body));
+        auto responseBody = co_await readLuaBoundedResponseBody(
+            kj::mv(response.body), LuaRuntime::MAX_D1_RESPONSE_BYTES, "D1 response");
         if (response.status < 200 || response.status >= 300) {
           KJ_FAIL_REQUIRE("D1 service returned HTTP status", response.status, ":",
               kj::StringPtr(
@@ -1901,6 +2162,61 @@ kj::Promise<void> LuaRequestContext::execute(lua_State* coroutine, LuaHostOperat
         pushJsonText(coroutine, kj::StringPtr(json, responseBody.size()));
       } else {
         KJ_FAIL_REQUIRE("D1 bindings are unavailable in this context");
+      }
+    }
+    KJ_CASE_ONEOF(aiRun, LuaAiRunRequest) {
+      KJ_IF_SOME(host, hostOperations) {
+        auto requestBody = kj::heapArray<kj::byte>(aiRun.body.size());
+        if (requestBody.size() > 0) {
+          std::memcpy(requestBody.begin(), aiRun.body.begin(), requestBody.size());
+        }
+        kj::Vector<LuaHttpHeader> headers;
+        headers.add(LuaHttpHeader{
+          .name = kj::str("content-type"),
+          .value = kj::str("application/json"),
+        });
+        headers.add(LuaHttpHeader{
+          .name = kj::str("cf-consn-sdk-version"),
+          .value = kj::str("2.0.0"),
+        });
+        headers.add(LuaHttpHeader{
+          .name = kj::str("cf-consn-model-id"),
+          .value = kj::mv(aiRun.model),
+        });
+        auto response = co_await host->fetch(LuaHttpRequest{
+          .method = kj::str("POST"),
+          .url = kj::str("https://workers-binding.ai/run?version=3"),
+          .headers = kj::mv(headers),
+          .body = kj::mv(requestBody),
+          .serviceBindingIndex = kj::some(static_cast<size_t>(aiRun.bindingIndex)),
+        });
+        bool isJson = false;
+        if (response.status >= 200 && response.status < 300) {
+          for (const auto& header: response.headers) {
+            if (asciiCaseInsensitiveEquals(header.name, "content-type"_kj) &&
+                header.value == "application/json") {
+              isJson = true;
+              break;
+            }
+          }
+        }
+        auto responseBody = co_await readLuaBoundedResponseBody(
+            kj::mv(response.body), LuaRuntime::MAX_AI_RESPONSE_BYTES, "Workers AI response");
+        const char* responseText =
+            responseBody.size() == 0 ? "" : reinterpret_cast<const char*>(responseBody.begin());
+        lua_createtable(coroutine, 0, 4);
+        lua_pushinteger(coroutine, response.status);
+        lua_setfield(coroutine, -2, "status");
+        lua_pushboolean(coroutine, isJson);
+        lua_setfield(coroutine, -2, "isJson");
+        lua_pushlstring(coroutine, responseText, responseBody.size());
+        lua_setfield(coroutine, -2, "body");
+        if (isJson) {
+          pushJsonText(coroutine, kj::StringPtr(responseText, responseBody.size()));
+          lua_setfield(coroutine, -2, "value");
+        }
+      } else {
+        KJ_FAIL_REQUIRE("Workers AI bindings are unavailable in this context");
       }
     }
     KJ_CASE_ONEOF(cancelRequest, LuaBodyCancelRequest) {

@@ -1367,6 +1367,35 @@ KJ_TEST("Server: LuaJIT exposes per-request CF blob metadata") {
   conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*US:192\.0\.2\.1)");
 }
 
+KJ_TEST("Server: LuaJIT Workers AI binding routes run through its fetcher service") {
+  TestServer test(R"((
+    services = [
+      ( name = "lua",
+        worker = (
+          luaScript = "return { fetch = function(request, env) local result = env.AI:run('@cf/test/model', {prompt='hello'}); return { status = 200, body = result.response } end }",
+          bindings = [(name = "AI", wrapped = (
+            moduleName = "cloudflare-internal:ai-api",
+            innerBindings = [(name = "fetcher", service = "ai-mock")]
+          ))]
+        )
+      ),
+      ( name = "ai-mock",
+        worker = (
+          luaScript = "return { fetch = function() return { status = 200, headers = {{ name = 'content-type', value = 'application/json' }}, body = '{\\\"response\\\":\\\"model response\\\"}' } end }"
+        )
+      )
+    ],
+    sockets = [(name = "http", address = "test-addr", service = "lua")]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+  conn.recvRegex(R"(HTTP/1\.1 200 LuaJIT[\s\S]*model response)");
+}
+
 KJ_TEST("Server: LuaJIT D1 binding wraps a configured D1 service") {
   TestServer test(R"((
     services = [
@@ -1606,7 +1635,7 @@ KJ_TEST("Server: LuaJIT rejects invalid D1 wrapped binding configuration") {
 
   test.server.allowExperimental();
   test.expectErrors(R"(
-    service hello: LuaJIT D1 binding "DB" requires exactly one inner service binding named "fetcher".
+    service hello: LuaJIT wrapped binding "DB" requires exactly one inner service binding named "fetcher".
   )"_blockquote);
 }
 

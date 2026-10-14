@@ -54,6 +54,7 @@ struct LuaBinding {
     SERVICE,
     KV_NAMESPACE,
     D1_DATABASE,
+    AI,
   };
 
   kj::String name;
@@ -184,6 +185,10 @@ class LuaRuntime final {
   static constexpr size_t MAX_D1_SQL_BYTES = 64 * 1024;
   static constexpr size_t MAX_D1_BINDING_VALUES = 100;
   static constexpr size_t MAX_D1_RESPONSE_BYTES = 1024 * 1024;
+  static constexpr size_t MAX_AI_MODEL_ID_BYTES = 1024;
+  static constexpr size_t MAX_AI_JSON_BYTES = 1024 * 1024;
+  static constexpr size_t MAX_AI_JSON_DEPTH = 64;
+  static constexpr size_t MAX_AI_RESPONSE_BYTES = 1024 * 1024;
 
   // The module must return a table with a callable `fetch` field. The runtime calls it with
   // `(request, env)`, where `env` contains configured bindings and aliases `workerd.bindings`.

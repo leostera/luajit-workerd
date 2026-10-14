@@ -6072,26 +6072,28 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
         }
         case config::Worker::Binding::WRAPPED: {
           auto wrapped = binding.getWrapped();
-          if (wrapped.getModuleName() != "cloudflare-internal:d1-api" ||
-              wrapped.getEntrypoint() != "default") {
+          auto moduleName = wrapped.getModuleName();
+          bool isD1 = moduleName == "cloudflare-internal:d1-api";
+          bool isAi = moduleName == "cloudflare-internal:ai-api";
+          if ((!isD1 && !isAi) || wrapped.getEntrypoint() != "default") {
             unsupportedConfig = true;
-            errorReporter.addError(kj::str("LuaJIT worker \"", name,
-                "\" only supports the default cloudflare-internal:d1-api wrapped binding; ",
-                "binding \"", bindingName, "\" uses module ", wrapped.getModuleName(), "."));
+            errorReporter.addError(
+                kj::str("LuaJIT worker \"", name, "\" does not support wrapped binding \"",
+                    bindingName, "\" using module ", moduleName, "."));
             break;
           }
           auto innerBindings = wrapped.getInnerBindings();
           if (innerBindings.size() != 1 || innerBindings[0].getName() != "fetcher" ||
               innerBindings[0].which() != config::Worker::Binding::SERVICE) {
             unsupportedConfig = true;
-            errorReporter.addError(kj::str("LuaJIT D1 binding \"", bindingName,
+            errorReporter.addError(kj::str("LuaJIT wrapped binding \"", bindingName,
                 "\" requires exactly one inner service binding named \"fetcher\"."));
             break;
           }
           auto fetcher = innerBindings[0];
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
-            .type = LuaBinding::Type::D1_DATABASE,
+            .type = isD1 ? LuaBinding::Type::D1_DATABASE : LuaBinding::Type::AI,
             .serviceBindingIndex = luaServiceBindingConfigs.size(),
           });
           luaServiceBindingConfigs.add(LuaServiceBindingConfig{

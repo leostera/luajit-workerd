@@ -324,6 +324,36 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   }
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override {
+    if (aiMockEnabled) {
+      KJ_IF_SOME(bindingIndex, request.serviceBindingIndex) {
+        KJ_REQUIRE(bindingIndex == 0, "unexpected Workers AI service binding index");
+      } else {
+        KJ_FAIL_REQUIRE("Workers AI request did not use its configured service binding");
+      }
+      KJ_REQUIRE(request.method == "POST", "Workers AI request must use POST");
+      KJ_REQUIRE(request.url == "https://workers-binding.ai/run?version=3",
+          "unexpected Workers AI request URL", request.url);
+      aiRequestUrls.add(kj::str(request.url));
+      aiRequestBodies.add(asString(request.body.asPtr()));
+      for (const auto& header: request.headers) {
+        aiRequestHeaders.add(LuaHttpHeader{
+          .name = kj::str(header.name),
+          .value = kj::str(header.value),
+        });
+      }
+      lastRequest = kj::mv(request);
+      kj::Vector<LuaHttpHeader> headers;
+      headers.add(LuaHttpHeader{
+        .name = kj::str("content-type"),
+        .value = kj::str("application/json"),
+      });
+      co_return LuaHttpResponse{
+        .status = aiResponseStatus,
+        .headers = kj::mv(headers),
+        .body = newMemoryInputStream(aiResponseJson),
+      };
+    }
+
     if (d1MockEnabled) {
       KJ_IF_SOME(bindingIndex, request.serviceBindingIndex) {
         KJ_REQUIRE(bindingIndex == 0, "unexpected D1 service binding index");
@@ -367,6 +397,12 @@ class TestLuaHostOperations final: public LuaHostOperationsWithoutRequestBody {
   }
 
   kj::Maybe<LuaHttpRequest> lastRequest;
+  bool aiMockEnabled = false;
+  uint16_t aiResponseStatus = 200;
+  kj::String aiResponseJson = kj::str("");
+  kj::Vector<kj::String> aiRequestUrls;
+  kj::Vector<kj::String> aiRequestBodies;
+  kj::Vector<LuaHttpHeader> aiRequestHeaders;
   bool d1MockEnabled = false;
   kj::String d1QueryResponse = kj::str("");
   kj::String d1RunResponse = kj::str("");
@@ -2136,6 +2172,47 @@ KJ_TEST("LuaJIT passes configured bindings as fetch env") {
   auto second = runtime.fetch("GET"_kj, "/second"_kj, headers, nullptr).wait(io.waitScope);
   KJ_EXPECT(asString(first.body) == "hello:/first:1:true");
   KJ_EXPECT(asString(second.body) == "hello:/second:2:true");
+}
+
+KJ_TEST("LuaJIT Workers AI run sends JSON inputs and returns model output") {
+  auto io = kj::setupAsyncIo();
+  constexpr kj::StringPtr source = R"lua(
+    return {
+      fetch = function(_, env)
+        local result = env.AI:run("@cf/test/model", { prompt = "hello" }, { stop = { "x", workerd.null } })
+        return { status = 200, body = result.response }
+      end
+    }
+  )lua"_kj;
+
+  kj::Vector<LuaBinding> bindings;
+  bindings.add(LuaBinding{
+    .name = kj::str("AI"),
+    .type = LuaBinding::Type::AI,
+    .serviceBindingIndex = 0,
+  });
+  LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
+  TestLuaHostOperations host;
+  host.aiMockEnabled = true;
+  host.aiResponseJson = kj::str(R"({"response":"model response"})");
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto response =
+      runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
+  KJ_EXPECT(asString(response.body) == "model response");
+  KJ_EXPECT(host.aiRequestUrls.size() == 1);
+  KJ_EXPECT(host.aiRequestUrls[0] == "https://workers-binding.ai/run?version=3");
+  KJ_EXPECT(host.aiRequestBodies[0] ==
+      R"json({"inputs":{"prompt":"hello"},"options":{"stop":["x",null]}})json");
+  bool hasModelHeader = false;
+  bool hasSdkHeader = false;
+  for (const auto& header: host.aiRequestHeaders) {
+    hasModelHeader |= header.name == "cf-consn-model-id" && header.value == "@cf/test/model";
+    hasSdkHeader |= header.name == "cf-consn-sdk-version" && header.value == "2.0.0";
+  }
+  KJ_EXPECT(hasModelHeader);
+  KJ_EXPECT(hasSdkHeader);
 }
 
 KJ_TEST("LuaJIT D1 binding supports prepared first, all, and run queries") {

@@ -2,7 +2,7 @@
 
 This sample compares LuaJIT and V8 HTTP workers through the same workerd binary, HTTP server, and loopback client. The Lua handler uses `env.GREETING` from a configured text binding to produce the same `/hello` response as the V8 worker. Lua does not provide a `ctx` argument.
 
-Both workers expose matching endpoints:
+Both workers expose matching endpoints. This benchmark uses only a static text binding, so it remains account-independent and does not start the D1/Workers AI bridge; see [`lua-d1-ai`](../lua-d1-ai/README.md) for the remote-binding example.
 
 - `GET /hello` returns the same short text response. This mostly measures request dispatch and response overhead.
 - `GET /cpu?iters=N` runs the same deterministic numeric loop and returns identical compact JSON. This adds predictable handler work so the comparison is not just an empty-response measurement.
@@ -54,12 +54,12 @@ Use `--help` to change ports, concurrency, warmup, measurement duration, number 
 
 Two complete default-settings runs of the final handlers and driver on 2026-10-11 produced the following ranges. Each run reports throughput as the median across its three rounds and latency percentiles over requests pooled across those rounds. The table shows the minimum and maximum across the two runs. Readiness time covers the shared process and both listeners, not an individual runtime.
 
-| Endpoint | Runtime | Requests/s (range) | p50 latency (ms, range) | p95 latency (ms, range) |
-| --- | --- | ---: | ---: | ---: |
-| `/hello` | LuaJIT | 8,680.1–10,004.3 | 0.760–0.842 | 1.756–1.886 |
-| `/hello` | V8 | 3,994.5–4,024.3 | 1.402–1.445 | 2.063–2.183 |
-| `/cpu?iters=10000` | LuaJIT | 145.9–161.8 | 49.705–53.711 | 82.497–83.636 |
-| `/cpu?iters=10000` | V8 | 2,766.1–2,804.9 | 1.984–2.122 | 3.878–5.039 |
+| Endpoint           | Runtime | Requests/s (range) | p50 latency (ms, range) | p95 latency (ms, range) |
+| ------------------ | ------- | -----------------: | ----------------------: | ----------------------: |
+| `/hello`           | LuaJIT  |   8,680.1–10,004.3 |             0.760–0.842 |             1.756–1.886 |
+| `/hello`           | V8      |    3,994.5–4,024.3 |             1.402–1.445 |             2.063–2.183 |
+| `/cpu?iters=10000` | LuaJIT  |        145.9–161.8 |           49.705–53.711 |           82.497–83.636 |
+| `/cpu?iters=10000` | V8      |    2,766.1–2,804.9 |             1.984–2.122 |             3.878–5.039 |
 
 The shared workerd process was ready for both endpoints in 0.060–0.338 seconds across the two runs. The measured host and toolchain were:
 
