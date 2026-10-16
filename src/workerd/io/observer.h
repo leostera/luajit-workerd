@@ -8,6 +8,7 @@
 
 #include <workerd/io/features.capnp.h>
 #include <workerd/io/trace.h>
+#include <workerd/io/worker-invocation-observer.h>
 #include <workerd/jsg/observer.h>
 #include <workerd/util/sqlite.h>
 #include <workerd/util/strong-bool.h>
@@ -25,8 +26,6 @@ class IoContext;
 WD_STRONG_BOOL(SubrequestBodyRewindable);
 // Whether an outgoing actor call's target supports runtime retries. Colo-local actors do not.
 WD_STRONG_BOOL(ActorCallTargetRetryable);
-// Whether an outgoing request contributes to the logical subrequest count.
-WD_STRONG_BOOL(CountSubrequest);
 // Whether an outgoing actor call's payload can be sent again unchanged, e.g. a fetch with a
 // rewindable body or an RPC call whose arguments hold no externals.
 WD_STRONG_BOOL(ActorCallPayloadReplayable);
@@ -97,7 +96,7 @@ class OutgoingActorCallObserver {
 // Observes a specific request to a specific worker. Also observes outgoing subrequests.
 //
 // Observing anything is optional. Default implementations of all methods observe nothing.
-class RequestObserver: public kj::Refcounted {
+class RequestObserver: public kj::Refcounted, public WorkerInvocationObserver {
  public:
   // This is called when the request is converted to a WebSocket connection terminating in a worker.
   // An optional WebSocket observer may be returned to observe events on the worker's end of the
@@ -164,8 +163,8 @@ class RequestObserver: public kj::Refcounted {
 
   // Wrap an HttpClient to observe its request and response activity. `countSubrequest` controls
   // whether its usage contributes to the request's logical subrequest count.
-  virtual kj::Own<WorkerInterface> wrapSubrequestClient(
-      kj::Own<WorkerInterface> client, CountSubrequest countSubrequest);
+  kj::Own<WorkerInterface> wrapSubrequestClient(
+      kj::Own<WorkerInterface> client, CountSubrequest countSubrequest) override;
 
   // Wrap an HttpClient so that its usage is counted in the request's actor subrequest count.
   virtual kj::Own<WorkerInterface> wrapActorSubrequestClient(kj::Own<WorkerInterface> client);

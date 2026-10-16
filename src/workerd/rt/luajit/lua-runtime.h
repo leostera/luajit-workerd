@@ -9,6 +9,7 @@
 #include <kj/async.h>
 #include <kj/compat/http.h>
 #include <kj/memory.h>
+#include <kj/one-of.h>
 #include <kj/string.h>
 #include <kj/timer.h>
 #include <kj/vector.h>
@@ -45,25 +46,44 @@ class LuaHmacKey final {
 
 // A configured binding in the service-global env table (`workerd.bindings` alias).
 struct LuaBinding {
-  enum class Type {
-    TEXT,
-    DATA,
-    JSON,
-    HMAC_KEY,
-    NULL_VALUE,
-    SERVICE,
-    KV_NAMESPACE,
-    D1_DATABASE,
-    AI,
+  struct TextValue {
+    kj::String value;
+  };
+  struct DataValue {
+    kj::Array<kj::byte> value;
+  };
+  struct JsonValue {
+    kj::String value;
+  };
+  struct HmacKeyValue {
+    kj::Own<LuaHmacKey> key;
+  };
+  struct NullValue {};
+  struct ServiceBinding {
+    size_t index;
+  };
+  struct KvNamespaceBinding {
+    size_t index;
+  };
+  struct D1DatabaseBinding {
+    size_t fetcherIndex;
+  };
+  struct AiBinding {
+    size_t fetcherIndex;
   };
 
+  using Value = kj::OneOf<TextValue,
+      DataValue,
+      JsonValue,
+      HmacKeyValue,
+      NullValue,
+      ServiceBinding,
+      KvNamespaceBinding,
+      D1DatabaseBinding,
+      AiBinding>;
+
   kj::String name;
-  Type type;
-  size_t serviceBindingIndex = 0;
-  size_t kvBindingIndex = 0;
-  kj::Own<LuaHmacKey> hmacKey;
-  kj::String text;
-  kj::Array<kj::byte> data;
+  Value value;
 };
 
 struct LuaHttpHeader {

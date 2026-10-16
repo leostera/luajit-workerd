@@ -5,8 +5,8 @@
 #pragma once
 
 #include <workerd/io/outcome.capnp.h>
-#include <workerd/io/request-scope.h>
 #include <workerd/io/tracked-wasm-instance.h>
+#include <workerd/io/worker-invocation.h>
 
 #include <v8-isolate.h>
 

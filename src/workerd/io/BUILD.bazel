@@ -41,12 +41,12 @@ wd_cc_library(
         "io-util.c++",
         "legacy-hibernation-manager.c++",
         "per-isolate-bootstrap.c++",
-        "request-scope.c++",
         "stored-value.c++",
         "trace-stream.c++",
         "tracer.c++",
         "worker.c++",
         "worker-fs.c++",
+        "worker-invocation.c++",
     ] + ["//src/workerd/api:srcs"],
     hdrs = [
         "access-info.h",
@@ -57,12 +57,12 @@ wd_cc_library(
         "io-util.h",
         "legacy-hibernation-manager.h",
         "per-isolate-bootstrap.h",
-        "request-scope.h",
         "stored-value.h",
         "trace-stream.h",
         "tracer.h",
         "worker.h",
         "worker-fs.h",
+        "worker-invocation.h",
     ] + ["//src/workerd/api:hdrs"],
     implementation_deps = [
         "//src/per_isolate",
@@ -103,6 +103,7 @@ wd_cc_library(
         ":trace",
         ":wasm-instantiate-shim",
         ":worker-interface",
+        ":worker-invocation-observer",
         ":worker-source",
         "//src/rust/cxx-integration",
         "//src/workerd/api:analytics-engine_capnp",
@@ -294,6 +295,16 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "worker-invocation-observer",
+    hdrs = ["worker-invocation-observer.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/workerd/util:strong-bool",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+wd_cc_library(
     name = "observer",
     srcs = ["observer.c++"],
     hdrs = ["observer.h"],
@@ -305,6 +316,7 @@ wd_cc_library(
     deps = [
         ":features_capnp",
         ":trace",
+        ":worker-invocation-observer",
         "//src/workerd/jsg:observer",
         "//src/workerd/util:sqlite",
     ],
@@ -628,6 +640,13 @@ kj_test(
     deps = [
         ":io",
         "//src/workerd/tests:test-fixture",
+    ],
+)
+
+kj_test(
+    src = "worker-invocation-test.c++",
+    deps = [
+        ":io",
     ],
 )
 

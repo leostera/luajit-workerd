@@ -31,6 +31,7 @@
 #include <workerd/io/worker-entrypoint.h>
 #include <workerd/io/worker-fs.h>
 #include <workerd/io/worker-interface.h>
+#include <workerd/io/worker-invocation-observer.h>
 #include <workerd/io/worker.h>
 #include <workerd/rt/luajit/lua-runtime.h>
 #include <workerd/rt/luajit/lua-worker-interface.h>
@@ -2231,8 +2232,8 @@ class Server::LuaWorkerService final: public Service {
     KJ_REQUIRE(outbound.get() != nullptr, "LuaJIT worker has not been linked", name);
     return kj::heap<::workerd::rt::luajit::LuaWorkerInterface>(*runtime, *outbound, headerTable,
         kj::mv(metadata), server.entropySource, kj::heap<UnrestrictedSubrequestLimitPolicy>(),
-        kj::refcounted<RequestObserver>(), requestBodyMode, serviceBindings.asPtr(),
-        kvBindings.asPtr(), &kvOperationLimitPolicy);
+        kj::heap<NoopWorkerInvocationObserver>(), requestBodyMode, serviceBindings.asPtr(),
+        kvBindings.asPtr(), kvOperationLimitPolicy);
   }
 
   bool hasHandler(kj::StringPtr handlerName) override {
@@ -5993,22 +5994,19 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
         case config::Worker::Binding::TEXT:
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
-            .type = LuaBinding::Type::TEXT,
-            .text = kj::str(binding.getText()),
+            .value = LuaBinding::TextValue{.value = kj::str(binding.getText())},
           });
           break;
         case config::Worker::Binding::DATA:
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
-            .type = LuaBinding::Type::DATA,
-            .data = kj::heapArray<byte>(binding.getData()),
+            .value = LuaBinding::DataValue{.value = kj::heapArray<byte>(binding.getData())},
           });
           break;
         case config::Worker::Binding::JSON:
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
-            .type = LuaBinding::Type::JSON,
-            .text = kj::str(binding.getJson()),
+            .value = LuaBinding::JsonValue{.value = kj::str(binding.getJson())},
           });
           break;
         case config::Worker::Binding::CRYPTO_KEY: {
@@ -6024,8 +6022,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
           KJ_IF_SOME(key, kj::mv(parsedKey)) {
             luaBindings.add(LuaBinding{
               .name = kj::str(bindingName),
-              .type = LuaBinding::Type::HMAC_KEY,
-              .hmacKey = kj::mv(key),
+              .value = LuaBinding::HmacKeyValue{.key = kj::mv(key)},
             });
           }
           break;
@@ -6035,13 +6032,12 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
           if (value == nullptr) {
             luaBindings.add(LuaBinding{
               .name = kj::str(bindingName),
-              .type = LuaBinding::Type::NULL_VALUE,
+              .value = LuaBinding::NullValue{},
             });
           } else {
             luaBindings.add(LuaBinding{
               .name = kj::str(bindingName),
-              .type = LuaBinding::Type::TEXT,
-              .text = kj::str(value),
+              .value = LuaBinding::TextValue{.value = kj::str(value)},
             });
           }
           break;
@@ -6049,8 +6045,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
         case config::Worker::Binding::SERVICE: {
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
-            .type = LuaBinding::Type::SERVICE,
-            .serviceBindingIndex = luaServiceBindingConfigs.size(),
+            .value = LuaBinding::ServiceBinding{.index = luaServiceBindingConfigs.size()},
           });
           luaServiceBindingConfigs.add(LuaServiceBindingConfig{
             .designator = binding.getService(),
@@ -6061,8 +6056,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
         case config::Worker::Binding::KV_NAMESPACE: {
           luaBindings.add(LuaBinding{
             .name = kj::str(bindingName),
-            .type = LuaBinding::Type::KV_NAMESPACE,
-            .kvBindingIndex = luaKvBindingConfigs.size(),
+            .value = LuaBinding::KvNamespaceBinding{.index = luaKvBindingConfigs.size()},
           });
           luaKvBindingConfigs.add(LuaServiceBindingConfig{
             .designator = binding.getKvNamespace(),
@@ -6090,12 +6084,19 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
                 "\" requires exactly one inner service binding named \"fetcher\"."));
             break;
           }
+          auto fetcherIndex = luaServiceBindingConfigs.size();
           auto fetcher = innerBindings[0];
-          luaBindings.add(LuaBinding{
-            .name = kj::str(bindingName),
-            .type = isD1 ? LuaBinding::Type::D1_DATABASE : LuaBinding::Type::AI,
-            .serviceBindingIndex = luaServiceBindingConfigs.size(),
-          });
+          if (isD1) {
+            luaBindings.add(LuaBinding{
+              .name = kj::str(bindingName),
+              .value = LuaBinding::D1DatabaseBinding{.fetcherIndex = fetcherIndex},
+            });
+          } else {
+            luaBindings.add(LuaBinding{
+              .name = kj::str(bindingName),
+              .value = LuaBinding::AiBinding{.fetcherIndex = fetcherIndex},
+            });
+          }
           luaServiceBindingConfigs.add(LuaServiceBindingConfig{
             .designator = fetcher.getService(),
             .name = kj::str(bindingName, ".fetcher"),

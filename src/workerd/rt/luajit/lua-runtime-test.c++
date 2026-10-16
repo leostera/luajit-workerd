@@ -46,6 +46,68 @@ class InertSubrequestChannel final: public IoChannelFactory::SubrequestChannel {
   }
 };
 
+class PendingHostWorker final: public WorkerInterface {
+ public:
+  explicit PendingHostWorker(bool& canceled): canceled(canceled) {}
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody,
+      Response& response) override {
+    auto* canceledFlag = &canceled;
+    return kj::Promise<void>(kj::NEVER_DONE).attach(kj::defer([canceledFlag]() {
+      *canceledFlag = true;
+    }));
+  }
+
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    KJ_FAIL_REQUIRE("unexpected CONNECT");
+  }
+
+  kj::Promise<void> prewarm(kj::StringPtr url) override {
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+    KJ_FAIL_REQUIRE("unexpected scheduled event");
+  }
+
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+    KJ_FAIL_REQUIRE("unexpected alarm");
+  }
+
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    KJ_FAIL_REQUIRE("unexpected custom event");
+  }
+
+ private:
+  bool& canceled;
+};
+
+class PendingSubrequestChannel final: public IoChannelFactory::SubrequestChannel {
+ public:
+  explicit PendingSubrequestChannel(bool& canceled): canceled(canceled) {}
+
+  void requireAllowsTransfer() override {}
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    KJ_UNREACHABLE;
+  }
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    return kj::heap<PendingHostWorker>(canceled);
+  }
+
+ private:
+  bool& canceled;
+};
+
 class TraceObservation final: public kj::Refcounted {
  public:
   kj::Vector<kj::String> operationNames;
@@ -516,8 +578,7 @@ KJ_TEST("LuaJIT KV namespace methods yield through host operations") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -547,8 +608,7 @@ KJ_TEST("LuaJIT KV missing entries return nil") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -580,8 +640,7 @@ KJ_TEST("LuaJIT KV getWithMetadata returns binary values and decoded metadata") 
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -614,8 +673,7 @@ KJ_TEST("LuaJIT KV getWithMetadata represents missing fields explicitly") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -649,8 +707,7 @@ KJ_TEST("LuaJIT KV list returns decoded keys, metadata, and cache status") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -680,8 +737,7 @@ KJ_TEST("LuaJIT KV list rejects malformed service results") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -710,8 +766,7 @@ KJ_TEST("LuaJIT KV response bodies are bounded") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -780,6 +835,36 @@ KJ_TEST("LuaJIT malformed request.cf metadata raises a catchable Lua error") {
   auto response =
       runtime.fetch("GET"_kj, "/invalid-cf"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
   KJ_EXPECT(asString(response.body) == "false:string");
+}
+
+KJ_TEST("LuaIoContext cancels a pending KV host operation when its invocation ends") {
+  auto io = kj::setupAsyncIo();
+  auto outbound = kj::refcounted<InertSubrequestChannel>();
+  kj::HttpHeaderTable headerTable;
+  bool canceledRequest = false;
+  kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings;
+  kvBindings.add(kj::refcounted<PendingSubrequestChannel>(canceledRequest));
+  kj::Maybe<kj::Promise<LuaKvGetResponse>> pending;
+
+  {
+    auto host =
+        kj::heap<LuaIoContext>(*outbound, headerTable, IoChannelFactory::SubrequestMetadata{},
+            testEntropySource(), kj::heap<UnrestrictedSubrequestLimitPolicy>(),
+            kj::refcounted<RequestObserver>(), nullptr, kvBindings.asPtr());
+    pending = host->kvGet(0, kj::str("key"), LuaKvGetOptions{}, LuaKvGetMode::VALUE);
+    KJ_EXPECT(!KJ_ASSERT_NONNULL(pending).poll(io.waitScope));
+  }
+
+  KJ_EXPECT(canceledRequest);
+  KJ_IF_SOME(operation, kj::mv(pending)) {
+    auto canceled = kj::mv(operation).then(
+        [](LuaKvGetResponse&&) { return false; }, [](kj::Exception&& exception) {
+      return exception.getType() == kj::Exception::Type::DISCONNECTED;
+    });
+    KJ_EXPECT(canceled.wait(io.waitScope));
+  } else {
+    KJ_FAIL_ASSERT("host invocation did not produce a pending KV operation");
+  }
 }
 
 KJ_TEST("LuaJIT inbound request bodies stream in async bounded chunks") {
@@ -1554,8 +1639,7 @@ KJ_TEST("LuaJIT service-binding requests preserve subrequest accounting") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("TARGET"),
-    .type = LuaBinding::Type::SERVICE,
-    .serviceBindingIndex = 0,
+    .value = LuaBinding::ServiceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   auto outbound = kj::refcounted<RecordingSubrequestChannel>();
@@ -1652,8 +1736,7 @@ KJ_TEST("LuaJIT KV bindings preserve operation and in-house subrequest accountin
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   auto outbound = kj::refcounted<RecordingSubrequestChannel>();
@@ -1668,7 +1751,7 @@ KJ_TEST("LuaJIT KV bindings preserve operation and in-house subrequest accountin
   LuaIoContext host(*outbound, headerTable, {}, testEntropySource(),
       kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
       kj::refcounted<RecordingRequestObserver>(accounting.addRef()), nullptr, kvChannels.asPtr(),
-      &kvPolicy);
+      kvPolicy);
 
   auto response =
       runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
@@ -1704,8 +1787,7 @@ KJ_TEST("LuaJIT KV policy rejects an operation before routing") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("KV"),
-    .type = LuaBinding::Type::KV_NAMESPACE,
-    .kvBindingIndex = 0,
+    .value = LuaBinding::KvNamespaceBinding{.index = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   auto outbound = kj::refcounted<RecordingSubrequestChannel>();
@@ -1720,7 +1802,7 @@ KJ_TEST("LuaJIT KV policy rejects an operation before routing") {
   LuaIoContext host(*outbound, headerTable, {}, testEntropySource(),
       kj::heap<RecordingSubrequestLimitPolicy>(accounting.addRef()),
       kj::refcounted<RecordingRequestObserver>(accounting.addRef()), nullptr, kvChannels.asPtr(),
-      &kvPolicy);
+      kvPolicy);
 
   auto response =
       runtime.fetch("GET"_kj, "/"_kj, headers, nullptr, host.getPtr()).wait(io.waitScope);
@@ -2069,30 +2151,27 @@ KJ_TEST("LuaJIT HMAC CryptoKey bindings are opaque and enforce usages") {
   signingAndVerifying.add(LuaHmacKeyUsage::VERIFY);
   bindings.add(LuaBinding{
     .name = kj::str("SIGNING_KEY"),
-    .type = LuaBinding::Type::HMAC_KEY,
-    .hmacKey = makeKey("SHA-256"_kj, signingAndVerifying.releaseAsArray()),
+    .value = LuaBinding::HmacKeyValue{.key = makeKey(
+                                          "SHA-256"_kj, signingAndVerifying.releaseAsArray())},
   });
   kj::Vector<LuaHmacKeyUsage> verifyOnly;
   verifyOnly.add(LuaHmacKeyUsage::VERIFY);
   bindings.add(LuaBinding{
     .name = kj::str("VERIFY_ONLY"),
-    .type = LuaBinding::Type::HMAC_KEY,
-    .hmacKey = makeKey("SHA-256"_kj, verifyOnly.releaseAsArray()),
+    .value = LuaBinding::HmacKeyValue{.key = makeKey("SHA-256"_kj, verifyOnly.releaseAsArray())},
   });
   kj::Vector<LuaHmacKeyUsage> signOnly;
   signOnly.add(LuaHmacKeyUsage::SIGN);
   bindings.add(LuaBinding{
     .name = kj::str("SIGN_ONLY"),
-    .type = LuaBinding::Type::HMAC_KEY,
-    .hmacKey = makeKey("SHA-256"_kj, signOnly.releaseAsArray()),
+    .value = LuaBinding::HmacKeyValue{.key = makeKey("SHA-256"_kj, signOnly.releaseAsArray())},
   });
   auto addSigningKey = [&](kj::StringPtr name, kj::StringPtr hashAlgorithm) {
     kj::Vector<LuaHmacKeyUsage> usages;
     usages.add(LuaHmacKeyUsage::SIGN);
     bindings.add(LuaBinding{
       .name = kj::str(name),
-      .type = LuaBinding::Type::HMAC_KEY,
-      .hmacKey = makeKey(hashAlgorithm, usages.releaseAsArray()),
+      .value = LuaBinding::HmacKeyValue{.key = makeKey(hashAlgorithm, usages.releaseAsArray())},
     });
   };
   addSigningKey("SHA1_KEY"_kj, "SHA-1"_kj);
@@ -2121,8 +2200,7 @@ KJ_TEST("LuaJIT service binding fetches select their configured channel") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("TARGET"),
-    .type = LuaBinding::Type::SERVICE,
-    .serviceBindingIndex = 1,
+    .value = LuaBinding::ServiceBinding{.index = 1},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations hostOperations;
@@ -2161,8 +2239,7 @@ KJ_TEST("LuaJIT passes configured bindings as fetch env") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("GREETING"),
-    .type = LuaBinding::Type::TEXT,
-    .text = kj::str("hello"),
+    .value = LuaBinding::TextValue{.value = kj::str("hello")},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   kj::HttpHeaderTable headerTable;
@@ -2188,8 +2265,7 @@ KJ_TEST("LuaJIT Workers AI run sends JSON inputs and returns model output") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("AI"),
-    .type = LuaBinding::Type::AI,
-    .serviceBindingIndex = 0,
+    .value = LuaBinding::AiBinding{.fetcherIndex = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -2236,8 +2312,7 @@ KJ_TEST("LuaJIT D1 binding supports prepared first, all, and run queries") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("DB"),
-    .type = LuaBinding::Type::D1_DATABASE,
-    .serviceBindingIndex = 0,
+    .value = LuaBinding::D1DatabaseBinding{.fetcherIndex = 0},
   });
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
   TestLuaHostOperations host;
@@ -2281,8 +2356,7 @@ KJ_TEST("LuaJIT D1 query text and string parameters require valid UTF-8") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("DB"),
-    .type = LuaBinding::Type::D1_DATABASE,
-    .serviceBindingIndex = 0,
+    .value = LuaBinding::D1DatabaseBinding{.fetcherIndex = 0},
   });
   TestLuaHostOperations host;
   host.d1MockEnabled = true;
@@ -2296,8 +2370,7 @@ KJ_TEST("LuaJIT D1 query text and string parameters require valid UTF-8") {
   kj::Vector<LuaBinding> parameterBindings;
   parameterBindings.add(LuaBinding{
     .name = kj::str("DB"),
-    .type = LuaBinding::Type::D1_DATABASE,
-    .serviceBindingIndex = 0,
+    .value = LuaBinding::D1DatabaseBinding{.fetcherIndex = 0},
   });
   LuaRuntime parameterRuntime(
       invalidParameter, io.provider->getTimer(), parameterBindings.releaseAsArray());
@@ -2331,29 +2404,27 @@ KJ_TEST("LuaJIT exposes text, binary, and JSON bindings under workerd.bindings")
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("GREETING"),
-    .type = LuaBinding::Type::TEXT,
-    .text = kj::str("hello"),
+    .value = LuaBinding::TextValue{.value = kj::str("hello")},
   });
   auto binary = kj::heapArray<kj::byte>(3);
   std::memcpy(binary.begin(), "a\0b", 3);
   bindings.add(LuaBinding{
     .name = kj::str("BINARY"),
-    .type = LuaBinding::Type::DATA,
-    .data = kj::mv(binary),
+    .value = LuaBinding::DataValue{.value = kj::mv(binary)},
   });
   bindings.add(LuaBinding{
     .name = kj::str("EMPTY"),
-    .type = LuaBinding::Type::DATA,
-    .data = kj::heapArray<kj::byte>(0),
+    .value = LuaBinding::DataValue{.value = kj::heapArray<kj::byte>(0)},
   });
   bindings.add(LuaBinding{
     .name = kj::str("MISSING"),
-    .type = LuaBinding::Type::NULL_VALUE,
+    .value = LuaBinding::NullValue{},
   });
   bindings.add(LuaBinding{
     .name = kj::str("CONFIG"),
-    .type = LuaBinding::Type::JSON,
-    .text = kj::str(R"({"enabled":true,"count":2,"nilValue":null,"list":["x",null]})"),
+    .value =
+        LuaBinding::JsonValue{
+          .value = kj::str(R"({"enabled":true,"count":2,"nilValue":null,"list":["x",null]})")},
   });
 
   LuaRuntime runtime(source, io.provider->getTimer(), bindings.releaseAsArray());
@@ -2370,8 +2441,7 @@ KJ_TEST("LuaJIT rejects malformed JSON bindings") {
   kj::Vector<LuaBinding> bindings;
   bindings.add(LuaBinding{
     .name = kj::str("INVALID"),
-    .type = LuaBinding::Type::JSON,
-    .text = kj::str("{ invalid json }"),
+    .value = LuaBinding::JsonValue{.value = kj::str("{ invalid json }")},
   });
   KJ_EXPECT(kj::runCatchingExceptions([&]() {
     LuaRuntime runtime("return { fetch = function() return { status = 200, body = '' } end }"_kj,

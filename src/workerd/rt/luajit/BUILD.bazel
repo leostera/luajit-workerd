@@ -4,16 +4,9 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
 wd_cc_library(
     name = "luajit-runtime",
     srcs = ["lua-runtime.c++"],
-    hdrs = [
-        "lua-runtime.h",
-        "lua-worker-interface.h",
-    ],
+    hdrs = ["lua-runtime.h"],
     visibility = ["//src/workerd/server:__pkg__"],
     deps = [
-        "//src/workerd/io",
-        "//src/workerd/io:worker-interface",
-        "//src/workerd/util",
-        "//src/workerd/util:uuid",
         "@capnp-cpp//src/capnp/compat:json",
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj/compat:kj-http",
@@ -23,9 +16,27 @@ wd_cc_library(
     ],
 )
 
+wd_cc_library(
+    name = "luajit-host-adapter",
+    srcs = ["lua-worker-interface.c++"],
+    hdrs = ["lua-worker-interface.h"],
+    visibility = ["//src/workerd/server:__pkg__"],
+    deps = [
+        ":luajit-runtime",
+        "//src/workerd/io",
+        "//src/workerd/io:worker-interface",
+        "//src/workerd/io:worker-invocation-observer",
+        "//src/workerd/util",
+        "//src/workerd/util:uuid",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj/compat:kj-http",
+    ],
+)
+
 kj_test(
     src = "lua-runtime-test.c++",
     deps = [
+        ":luajit-host-adapter",
         ":luajit-runtime",
         "//src/workerd/util",
     ],

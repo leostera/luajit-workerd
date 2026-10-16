@@ -227,7 +227,10 @@ IoContext::IncomingRequest::IoContext_IncomingRequest(kj::Own<IoContext> context
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory)
     : context(kj::mv(contextParam)),
       metrics(kj::mv(metricsParam)),
-      requestScope(context->getLimitEnforcer(), *metrics, &context->getLimitEnforcer()),
+      workerInvocation(context->getLimitEnforcer(),
+          *metrics,
+          ExecutionContextCancellationDomain{},
+          context->getLimitEnforcer()),
       workerTracer(kj::mv(workerTracer)),
       ioChannelFactory(kj::mv(ioChannelFactoryParam)),
       accessInfo(kj::mv(accessInfo)),
@@ -1103,8 +1106,8 @@ kj::Own<WorkerInterface> IoContext::getSubrequestNoChecks(
 
   if (options.wrapMetrics) {
     auto& metrics = getMetrics();
-    ret =
-        getCurrentIncomingRequest().requestScope.wrapSubrequestClient(kj::mv(ret), countSubrequest);
+    ret = getCurrentIncomingRequest().workerInvocation.wrapSubrequestClient(
+        kj::mv(ret), countSubrequest);
     ret = worker->getIsolate().wrapSubrequestClient(
         kj::mv(ret), getHeaderIds().contentEncoding, metrics);
   }
@@ -1129,7 +1132,7 @@ kj::Own<WorkerInterface> IoContext::getSubrequestNoChecks(
 kj::Own<WorkerInterface> IoContext::getSubrequest(
     kj::FunctionParam<kj::Own<WorkerInterface>(TraceContext&, IoChannelFactory&)> func,
     SubrequestOptions options) {
-  getCurrentIncomingRequest().requestScope.checkSubrequest(
+  getCurrentIncomingRequest().workerInvocation.checkSubrequest(
       options.inHouse ? SubrequestType::IN_HOUSE : SubrequestType::EXTERNAL);
   return getSubrequestNoChecks(kj::mv(func), kj::mv(options), CountSubrequest::YES);
 }
@@ -1234,7 +1237,7 @@ kj::Own<CacheClient> IoContext::getCacheClient() {
   //   as subrequests in metrics and logs (like in-house requests aren't), but historically the
   //   subrequest limit still applied. Since I can't currently think of a use case for more than 50
   //   cache API requests per request, I'm leaving it as-is for now.
-  getCurrentIncomingRequest().requestScope.checkSubrequest(SubrequestType::EXTERNAL);
+  getCurrentIncomingRequest().workerInvocation.checkSubrequest(SubrequestType::EXTERNAL);
   auto ret = getIoChannelFactory().getCache();
 
   // Apply external memory adjustment for Cache API subrequests (same as other subrequests in

@@ -18,6 +18,7 @@
 #include <workerd/io/limit-enforcer.h>
 #include <workerd/io/trace.h>
 #include <workerd/io/worker-fs.h>
+#include <workerd/io/worker-invocation.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/util/exception.h>
@@ -209,7 +210,7 @@ class IoContext_IncomingRequest final {
  private:
   kj::Own<IoContext> context;
   kj::Own<RequestObserver> metrics;
-  RequestScope requestScope;
+  WorkerInvocation workerInvocation;
   kj::Maybe<kj::Own<BaseTracer>> workerTracer;
   kj::Rc<IoChannelFactory> ioChannelFactory;
   kj::Maybe<kj::Own<AccessInfo>> accessInfo;

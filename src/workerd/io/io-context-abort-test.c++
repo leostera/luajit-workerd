@@ -12,6 +12,50 @@
 namespace workerd {
 namespace {
 
+class PendingWorkerInterface final: public WorkerInterface {
+ public:
+  explicit PendingWorkerInterface(bool& operationDestroyed)
+      : operationDestroyed(operationDestroyed) {}
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody,
+      Response& response) override {
+    KJ_FAIL_REQUIRE("unexpected HTTP request");
+  }
+
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    KJ_FAIL_REQUIRE("unexpected CONNECT");
+  }
+
+  kj::Promise<void> prewarm(kj::StringPtr url) override {
+    auto* destroyed = &operationDestroyed;
+    return kj::Promise<void>(kj::NEVER_DONE).attach(kj::defer([destroyed]() {
+      *destroyed = true;
+    }));
+  }
+
+  kj::Promise<ScheduledResult> runScheduled(kj::Date scheduledTime, kj::StringPtr cron) override {
+    KJ_FAIL_REQUIRE("unexpected scheduled event");
+  }
+
+  kj::Promise<AlarmResult> runAlarm(kj::Date scheduledTime, uint32_t retryCount) override {
+    KJ_FAIL_REQUIRE("unexpected alarm");
+  }
+
+  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
+    KJ_FAIL_REQUIRE("unexpected custom event");
+  }
+
+ private:
+  bool& operationDestroyed;
+};
+
 KJ_TEST("JS queued before abort() does not run after it") {
   TestFixture fixture;
   auto request = fixture.newIncomingRequest();
@@ -45,6 +89,65 @@ KJ_TEST("JS queued before abort() does not run after it") {
   KJ_EXPECT(!secondRan);
 
   fixture.drainAndDestroy(kj::mv(request));
+}
+
+KJ_TEST("JS incoming requests use WorkerInvocation for subrequest admission") {
+  uint checkedSubrequests = 0;
+  TestFixture fixture(TestFixture::SetupParams{
+    .useRealTimers = false,
+    .checkedSubrequestCount = checkedSubrequests,
+  });
+  auto request = fixture.newIncomingRequest();
+  bool operationDestroyed = false;
+
+  auto client = request->getContext().getSubrequest(
+      [&operationDestroyed](TraceContext&, IoChannelFactory&) -> kj::Own<WorkerInterface> {
+    return kj::heap<PendingWorkerInterface>(operationDestroyed);
+  },
+      IoContext::SubrequestOptions{
+        .inHouse = false,
+        .wrapMetrics = true,
+        .operationName = kj::none,
+        .existingTraceContext = kj::none,
+      });
+  KJ_EXPECT(client.get() != nullptr);
+  KJ_EXPECT(checkedSubrequests == 1);
+
+  fixture.drainAndDestroy(kj::mv(request));
+}
+
+KJ_TEST("JS actor subrequests survive request handoff") {
+  TestFixture fixture(TestFixture::SetupParams{
+    .actorId = Worker::Actor::Id(kj::str("invocation-cancellation-test")),
+    .useRealTimers = false,
+  });
+  auto context = fixture.newIoContext();
+  auto firstRequest = fixture.newIncomingRequest(*context);
+  auto& waitScope = fixture.getWaitScope();
+
+  bool operationDestroyed = false;
+  auto hostClient = context->getSubrequest(
+      [&operationDestroyed](TraceContext&, IoChannelFactory&) -> kj::Own<WorkerInterface> {
+    return kj::heap<PendingWorkerInterface>(operationDestroyed);
+  },
+      IoContext::SubrequestOptions{
+        .inHouse = false,
+        .wrapMetrics = true,
+        .operationName = kj::none,
+        .existingTraceContext = kj::none,
+      });
+  auto hostOperation = hostClient->prewarm("/"_kj);
+  auto secondRequest = fixture.newIncomingRequest(*context);
+
+  fixture.drainAndDestroy(kj::mv(firstRequest));
+  KJ_EXPECT(!hostOperation.poll(waitScope));
+  KJ_EXPECT(!operationDestroyed);
+
+  hostClient = nullptr;
+  KJ_EXPECT(!operationDestroyed);
+  hostOperation = nullptr;
+  KJ_EXPECT(operationDestroyed);
+  fixture.drainAndDestroy(kj::mv(secondRequest));
 }
 
 }  // namespace

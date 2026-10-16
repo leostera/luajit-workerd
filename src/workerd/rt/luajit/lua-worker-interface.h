@@ -5,18 +5,14 @@
 #pragma once
 
 #include <workerd/io/io-channels.h>
-#include <workerd/io/request-scope.h>
 #include <workerd/io/worker-interface.h>
+#include <workerd/io/worker-invocation.h>
 #include <workerd/rt/luajit/lua-runtime.h>
-
-namespace workerd {
-class RequestObserver;
-}
 
 namespace workerd::rt::luajit {
 
-// Request-scoped Lua host operations. This composes the shared request accounting/observer scope
-// with Lua's own route and trace metadata, without depending on JS worker or isolate state.
+// Request-scoped Lua host operations. This composes WorkerInvocation with Lua's route and trace
+// metadata, without depending on JS worker or isolate state.
 class LuaIoContext final: public LuaHostOperations {
  public:
   LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
@@ -24,10 +20,10 @@ class LuaIoContext final: public LuaHostOperations {
       IoChannelFactory::SubrequestMetadata metadata,
       kj::EntropySource& entropySource,
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-      kj::Own<workerd::RequestObserver> observer,
+      kj::Own<WorkerInvocationObserver> observer,
       kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr,
       kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings = nullptr,
-      KvOperationLimitPolicy* kvOperationLimitPolicy = nullptr);
+      kj::Maybe<KvOperationLimitPolicy&> kvOperationLimitPolicy = kj::none);
   ~LuaIoContext() noexcept(false) override;
 
   kj::Promise<LuaHttpResponse> fetch(LuaHttpRequest request) override;
@@ -57,8 +53,8 @@ class LuaIoContext final: public LuaHostOperations {
       TraceContext& tracing);
 
   kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy;
-  kj::Own<workerd::RequestObserver> observer;
-  RequestScope requestScope;
+  kj::Own<WorkerInvocationObserver> observer;
+  WorkerInvocation workerInvocation;
   IoChannelFactory::SubrequestChannel& outbound;
   kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings;
   kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings;
@@ -79,11 +75,11 @@ class LuaWorkerInterface final: public WorkerInterface {
       IoChannelFactory::SubrequestMetadata metadata,
       kj::EntropySource& entropySource,
       kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-      kj::Own<workerd::RequestObserver> observer,
+      kj::Own<WorkerInvocationObserver> observer,
       LuaRequestBodyMode requestBodyMode,
       kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings = nullptr,
       kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings = nullptr,
-      KvOperationLimitPolicy* kvOperationLimitPolicy = nullptr);
+      kj::Maybe<KvOperationLimitPolicy&> kvOperationLimitPolicy = kj::none);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,

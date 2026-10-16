@@ -583,12 +583,11 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   friend class Worker;
 };
 
-// The "API isolate" is a wrapper around JSG which determines which APIs are available. This is
-// an abstract interface which can be customized to make the runtime support a different set of
-// APIs. All JSG wrapping/unwrapping is encapsulated within this.
+// The JavaScript API isolate wraps JSG/V8 and determines which APIs are available to a JS worker.
+// This interface can customize the exposed JavaScript API surface; it is not a language-runtime
+// backend interface. JSG wrapping and unwrapping remain encapsulated here.
 //
-// In contrast, the rest of the classes in `worker.h` are concerned more with lifecycle
-// management.
+// In contrast, the rest of the classes in `worker.h` manage JavaScript worker lifecycle.
 class Worker::Api {
  public:
   // Get the current `Api` or throw if we're not currently executing JavaScript.

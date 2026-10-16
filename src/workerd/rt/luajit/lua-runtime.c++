@@ -4,12 +4,6 @@
 
 #include "lua-runtime.h"
 
-#include "lua-worker-interface.h"
-
-#include <workerd/io/observer.h>
-#include <workerd/util/http-util.h>
-#include <workerd/util/uuid.h>
-
 #include <lua.hpp>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -879,82 +873,71 @@ void pushLuaBindings(lua_State* state, kj::ArrayPtr<LuaBinding> bindings) {
   lua_createtable(state, 0, static_cast<int>(bindings.size()));
   for (auto& binding: bindings) {
     lua_pushlstring(state, binding.name.begin(), binding.name.size());
-    switch (binding.type) {
-      case LuaBinding::Type::TEXT:
-        lua_pushlstring(state, binding.text.begin(), binding.text.size());
-        break;
-      case LuaBinding::Type::DATA: {
-        const char* bytes =
-            binding.data.size() == 0 ? "" : reinterpret_cast<const char*>(binding.data.begin());
-        lua_pushlstring(state, bytes, binding.data.size());
-        break;
+    KJ_SWITCH_ONEOF(binding.value) {
+      KJ_CASE_ONEOF(text, LuaBinding::TextValue) {
+        lua_pushlstring(state, text.value.begin(), text.value.size());
       }
-      case LuaBinding::Type::JSON: {
+      KJ_CASE_ONEOF(data, LuaBinding::DataValue) {
+        const char* bytes =
+            data.value.size() == 0 ? "" : reinterpret_cast<const char*>(data.value.begin());
+        lua_pushlstring(state, bytes, data.value.size());
+      }
+      KJ_CASE_ONEOF(json, LuaBinding::JsonValue) {
         capnp::JsonCodec codec;
         capnp::MallocMessageBuilder arena;
         auto root = arena.initRoot<capnp::JsonValue>();
         KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
-          codec.decodeRaw(binding.text, root);
+          codec.decodeRaw(json.value, root);
           pushJsonValue(state, root.asReader());
         })) {
           KJ_FAIL_REQUIRE("LuaJIT JSON binding", binding.name, "is invalid:", exception);
         }
-        break;
       }
-      case LuaBinding::Type::HMAC_KEY: {
-        KJ_REQUIRE(binding.hmacKey.get() != nullptr, "LuaJIT HMAC key binding has no key data");
-        auto algorithmName = binding.hmacKey->getHashAlgorithm();
+      KJ_CASE_ONEOF(hmacKey, LuaBinding::HmacKeyValue) {
+        KJ_REQUIRE(hmacKey.key.get() != nullptr, "LuaJIT HMAC key binding has no key data");
+        auto algorithmName = hmacKey.key->getHashAlgorithm();
         auto* algorithm = findLuaDigestAlgorithm(algorithmName.begin(), algorithmName.size());
         KJ_REQUIRE(isSupportedBoundHmacAlgorithm(algorithm),
             "LuaJIT CryptoKey binding only supports HMAC with SHA-1/SHA-2");
-        pushLuaHmacKey(state, kj::mv(binding.hmacKey));
-        break;
+        pushLuaHmacKey(state, kj::mv(hmacKey.key));
       }
-      case LuaBinding::Type::NULL_VALUE:
+      KJ_CASE_ONEOF(nullValue, LuaBinding::NullValue) {
         getRawField(state, -3, "null");
         KJ_REQUIRE(!lua_isnil(state, -1), "LuaJIT null sentinel is unavailable");
-        break;
-      case LuaBinding::Type::SERVICE: {
+      }
+      KJ_CASE_ONEOF(service, LuaBinding::ServiceBinding) {
         getRawField(state, -3, "createServiceBinding");
         KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT service binding factory is unavailable");
-        KJ_REQUIRE(binding.serviceBindingIndex < static_cast<size_t>(INT_MAX),
-            "too many Lua service bindings");
-        lua_pushinteger(state, static_cast<lua_Integer>(binding.serviceBindingIndex + 1));
+        KJ_REQUIRE(service.index < static_cast<size_t>(INT_MAX), "too many Lua service bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(service.index + 1));
         int status = lua_pcall(state, 1, 1, 0);
         KJ_REQUIRE(
             status == 0, "failed to create Lua service binding:", readLuaErrorMessage(state));
-        break;
       }
-      case LuaBinding::Type::KV_NAMESPACE: {
+      KJ_CASE_ONEOF(kvNamespace, LuaBinding::KvNamespaceBinding) {
         getRawField(state, -3, "createKvNamespace");
         KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT KV binding factory is unavailable");
-        KJ_REQUIRE(
-            binding.kvBindingIndex < static_cast<size_t>(INT_MAX), "too many Lua KV bindings");
-        lua_pushinteger(state, static_cast<lua_Integer>(binding.kvBindingIndex + 1));
+        KJ_REQUIRE(kvNamespace.index < static_cast<size_t>(INT_MAX), "too many Lua KV bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(kvNamespace.index + 1));
         int status = lua_pcall(state, 1, 1, 0);
         KJ_REQUIRE(status == 0, "failed to create Lua KV binding:", readLuaErrorMessage(state));
-        break;
       }
-      case LuaBinding::Type::AI: {
+      KJ_CASE_ONEOF(ai, LuaBinding::AiBinding) {
         getRawField(state, -3, "createAiBinding");
         KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT Workers AI binding factory is unavailable");
-        KJ_REQUIRE(binding.serviceBindingIndex < static_cast<size_t>(INT_MAX),
-            "too many Lua service bindings");
-        lua_pushinteger(state, static_cast<lua_Integer>(binding.serviceBindingIndex + 1));
+        KJ_REQUIRE(ai.fetcherIndex < static_cast<size_t>(INT_MAX), "too many Lua service bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(ai.fetcherIndex + 1));
         int status = lua_pcall(state, 1, 1, 0);
         KJ_REQUIRE(
             status == 0, "failed to create Lua Workers AI binding:", readLuaErrorMessage(state));
-        break;
       }
-      case LuaBinding::Type::D1_DATABASE: {
+      KJ_CASE_ONEOF(d1, LuaBinding::D1DatabaseBinding) {
         getRawField(state, -3, "createD1Database");
         KJ_REQUIRE(lua_isfunction(state, -1), "LuaJIT D1 binding factory is unavailable");
-        KJ_REQUIRE(binding.serviceBindingIndex < static_cast<size_t>(INT_MAX),
-            "too many Lua service bindings");
-        lua_pushinteger(state, static_cast<lua_Integer>(binding.serviceBindingIndex + 1));
+        KJ_REQUIRE(d1.fetcherIndex < static_cast<size_t>(INT_MAX), "too many Lua service bindings");
+        lua_pushinteger(state, static_cast<lua_Integer>(d1.fetcherIndex + 1));
         int status = lua_pcall(state, 1, 1, 0);
         KJ_REQUIRE(status == 0, "failed to create Lua D1 binding:", readLuaErrorMessage(state));
-        break;
       }
     }
     lua_rawset(state, -3);
@@ -2148,7 +2131,7 @@ kj::Promise<void> LuaRequestContext::execute(lua_State* coroutine, LuaHostOperat
                                  : kj::str("http://d1/query?resultsFormat=ROWS_AND_COLUMNS"),
           .headers = kj::mv(headers),
           .body = kj::mv(requestBody),
-          .serviceBindingIndex = kj::some(static_cast<size_t>(d1Query.bindingIndex)),
+          .serviceBindingIndex = kj::Maybe<size_t>(d1Query.bindingIndex),
         });
         auto responseBody = co_await readLuaBoundedResponseBody(
             kj::mv(response.body), LuaRuntime::MAX_D1_RESPONSE_BYTES, "D1 response");
@@ -2188,7 +2171,7 @@ kj::Promise<void> LuaRequestContext::execute(lua_State* coroutine, LuaHostOperat
           .url = kj::str("https://workers-binding.ai/run?version=3"),
           .headers = kj::mv(headers),
           .body = kj::mv(requestBody),
-          .serviceBindingIndex = kj::some(static_cast<size_t>(aiRun.bindingIndex)),
+          .serviceBindingIndex = kj::Maybe<size_t>(aiRun.bindingIndex),
         });
         bool isJson = false;
         if (response.status >= 200 && response.status < 300) {
@@ -2514,430 +2497,6 @@ kj::Promise<LuaRuntime::Response> LuaRuntime::fetch(kj::StringPtr method,
     .headers = kj::mv(responseHeaders),
     .body = kj::mv(bodyBytes),
   };
-}
-
-namespace {
-
-kj::Promise<void> respondNotImplemented(kj::HttpService::Response& response,
-    const kj::HttpHeaders& requestHeaders,
-    kj::StringPtr feature) {
-  auto responseHeaders = requestHeaders.cloneShallow();
-  responseHeaders.clear();
-  auto body = kj::str("LuaJIT workers do not support ", feature, ".");
-  auto output = response.send(501, "Not Implemented"_kj, responseHeaders, body.size());
-  co_await output->write(body.asBytes());
-}
-
-}  // namespace
-
-LuaIoContext::LuaIoContext(IoChannelFactory::SubrequestChannel& outbound,
-    const kj::HttpHeaderTable& headerTable,
-    IoChannelFactory::SubrequestMetadata metadata,
-    kj::EntropySource& entropySource,
-    kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-    kj::Own<workerd::RequestObserver> observer,
-    kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings,
-    kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings,
-    KvOperationLimitPolicy* kvOperationLimitPolicy)
-    : subrequestLimitPolicy(kj::mv(subrequestLimitPolicy)),
-      observer(kj::mv(observer)),
-      requestScope(*this->subrequestLimitPolicy, *this->observer, kvOperationLimitPolicy),
-      outbound(outbound),
-      serviceBindings(serviceBindings),
-      kvBindings(kvBindings),
-      headerTable(headerTable),
-      entropySource(entropySource),
-      cfBlobJson(kj::mv(metadata.cfBlobJson)),
-      parentSpan(kj::mv(metadata.parentSpan)),
-      userSpanParent(kj::mv(metadata.userSpanParent)) {}
-
-LuaIoContext::~LuaIoContext() noexcept(false) = default;
-
-bool LuaIoContext::hasRequestBodyStream() const {
-  return requestBodyStream != kj::none;
-}
-
-void LuaIoContext::fillRandomBytes(kj::ArrayPtr<kj::byte> output) {
-  entropySource.generate(output);
-}
-
-kj::String LuaIoContext::generateRandomUuid() {
-  return workerd::randomUUID(entropySource);
-}
-
-kj::Maybe<kj::String> LuaIoContext::getRequestCfJson() const {
-  return cfBlobJson.map([](const kj::String& value) { return kj::str(value); });
-}
-
-void LuaIoContext::setRequestBodyStream(kj::AsyncInputStream& stream) {
-  KJ_REQUIRE(requestBodyStream == kj::none, "inbound request body stream is already set");
-  requestBodyStream = stream;
-  requestBodyBytesRead = 0;
-}
-
-void LuaIoContext::clearRequestBodyStream() {
-  requestBodyStream = kj::none;
-  requestBodyBytesRead = 0;
-}
-
-kj::Promise<kj::Maybe<kj::Array<kj::byte>>> LuaIoContext::readRequestBody(size_t maxBytes) {
-  KJ_REQUIRE(maxBytes >= 1 && maxBytes <= LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES,
-      "workerd.readRequestBody() chunk size is outside the allowed range");
-  KJ_IF_SOME(stream, requestBodyStream) {
-    size_t bytesRemaining = requestBodyBytesRead < LuaRuntime::MAX_HTTP_BODY_BYTES
-        ? LuaRuntime::MAX_HTTP_BODY_BYTES - requestBodyBytesRead
-        : 0;
-    size_t readLimit =
-        bytesRemaining == 0 ? 1 : (maxBytes < bytesRemaining ? maxBytes : bytesRemaining);
-    auto chunk = kj::heapArray<kj::byte>(readLimit);
-    size_t bytesRead = co_await stream.tryRead(chunk.begin(), 1, readLimit);
-    if (bytesRead == 0) co_return kj::none;
-    KJ_REQUIRE(
-        bytesRemaining != 0, "LuaJIT request body exceeds limit", LuaRuntime::MAX_HTTP_BODY_BYTES);
-    requestBodyBytesRead += bytesRead;
-    auto result = kj::heapArray<kj::byte>(bytesRead);
-    std::memcpy(result.begin(), chunk.begin(), bytesRead);
-    co_return kj::mv(result);
-  }
-  KJ_FAIL_REQUIRE("inbound request body streaming is unavailable in this context");
-}
-
-IoChannelFactory::SubrequestMetadata LuaIoContext::makeSubrequestMetadata(TraceContext& tracing) {
-  return IoChannelFactory::SubrequestMetadata{
-    .cfBlobJson = cfBlobJson.map([](const kj::String& value) { return kj::str(value); }),
-    .parentSpan = tracing.getInternalSpanParent(),
-    .userSpanParent = tracing.getUserSpanParent(),
-  };
-}
-
-kj::Own<kj::HttpClient> LuaIoContext::getKvHttpClient(size_t bindingIndex,
-    KvOperationType operation,
-    kj::StringPtr url,
-    kj::HttpHeaders& headers,
-    TraceContext& tracing) {
-  KJ_REQUIRE(bindingIndex < kvBindings.size(), "unknown Lua KV binding index", bindingIndex);
-  requestScope.checkKvOperation(operation);
-  requestScope.checkSubrequest(SubrequestType::IN_HOUSE);
-  auto subrequest = kvBindings[bindingIndex]->startRequest(IoChannelFactory::SubrequestMetadata{
-    .cfBlobJson = kj::none,
-    .parentSpan = tracing.getInternalSpanParent(),
-    .userSpanParent = tracing.getUserSpanParent(),
-  });
-  headers.addPtrPtr("CF-KV-FLPROD-405"_kj, url);
-  return asHttpClient(kj::mv(subrequest));
-}
-
-kj::Promise<LuaKvGetResponse> LuaIoContext::kvGet(
-    size_t bindingIndex, kj::String key, LuaKvGetOptions options, LuaKvGetMode mode) {
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str(
-                         mode == LuaKvGetMode::VALUE ? "lua.kv.get" : "lua.kv.get_with_metadata")));
-  tracing.setTag("cloudflare.kv.query.keys"_kjc, key.asPtr());
-  tracing.setTag("cloudflare.kv.query.keys.count"_kjc, static_cast<int64_t>(1));
-
-  kj::Url url;
-  url.scheme = kj::str("https");
-  url.host = kj::str("fake-host");
-  url.path.add(kj::mv(key));
-  url.query.add(kj::Url::QueryParam{kj::str("urlencoded"), kj::str("true")});
-  KJ_IF_SOME(cacheTtl, options.cacheTtl) {
-    url.query.add(kj::Url::QueryParam{kj::str("cache_ttl"), kj::str(cacheTtl)});
-    tracing.setTag("cloudflare.kv.query.cache_ttl"_kjc, static_cast<int64_t>(cacheTtl));
-  }
-  auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
-  kj::HttpHeaders headers(headerTable);
-  auto operation = mode == LuaKvGetMode::VALUE ? KvOperationType::GET : KvOperationType::GET_WITH;
-  auto client = getKvHttpClient(bindingIndex, operation, urlText, headers, tracing);
-  auto request = attachToRequest(client->request(kj::HttpMethod::GET, urlText, headers),
-      kj::Rc<kj::HttpClient>(kj::mv(client)));
-  auto response = co_await kj::mv(request.response);
-  kj::Maybe<kj::String> cacheStatus;
-  KJ_IF_SOME(headerId, headerTable.stringToId("cf-cache-status")) {
-    cacheStatus =
-        response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
-  }
-  if (response.statusCode == 404 || response.statusCode == 410) {
-    co_return LuaKvGetResponse{.body = kj::none, .cacheStatus = kj::mv(cacheStatus)};
-  }
-  KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
-      "Lua KV GET failed:", response.statusCode, response.statusText);
-  kj::Maybe<kj::String> metadata;
-  KJ_IF_SOME(headerId, headerTable.stringToId("cf-kv-metadata")) {
-    metadata =
-        response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
-  }
-  co_return LuaKvGetResponse{
-    .body = kj::mv(response.body),
-    .metadata = kj::mv(metadata),
-    .cacheStatus = kj::mv(cacheStatus),
-  };
-}
-
-kj::Promise<void> LuaIoContext::kvPut(
-    size_t bindingIndex, kj::String key, kj::Array<kj::byte> value, LuaKvPutOptions options) {
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str("lua.kv.put")));
-  tracing.setTag("cloudflare.kv.query.keys"_kjc, key.asPtr());
-  tracing.setTag("cloudflare.kv.query.keys.count"_kjc, static_cast<int64_t>(1));
-
-  kj::Url url;
-  url.scheme = kj::str("https");
-  url.host = kj::str("fake-host");
-  url.path.add(kj::mv(key));
-  url.query.add(kj::Url::QueryParam{kj::str("urlencoded"), kj::str("true")});
-  KJ_IF_SOME(expiration, options.expiration) {
-    url.query.add(kj::Url::QueryParam{kj::str("expiration"), kj::str(expiration)});
-    tracing.setTag("cloudflare.kv.query.expiration"_kjc, static_cast<int64_t>(expiration));
-  }
-  KJ_IF_SOME(expirationTtl, options.expirationTtl) {
-    url.query.add(kj::Url::QueryParam{kj::str("expiration_ttl"), kj::str(expirationTtl)});
-    tracing.setTag("cloudflare.kv.query.expiration_ttl"_kjc, static_cast<int64_t>(expirationTtl));
-  }
-  auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
-  kj::HttpHeaders headers(headerTable);
-  headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/octet-stream"_kj);
-  auto client = getKvHttpClient(bindingIndex, KvOperationType::PUT, urlText, headers, tracing);
-  auto request = attachToRequest(
-      client->request(kj::HttpMethod::PUT, urlText, headers, static_cast<uint64_t>(value.size())),
-      kj::Rc<kj::HttpClient>(kj::mv(client)));
-  KJ_REQUIRE(request.body.get() != nullptr, "Lua KV PUT request has no body stream");
-  auto writePromise = request.body->write(value).attach(kj::mv(request.body), kj::mv(value));
-  co_await kj::mv(writePromise);
-  auto response = co_await kj::mv(request.response);
-  KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
-      "Lua KV PUT failed:", response.statusCode, response.statusText);
-  co_await response.body->readAllBytes(64 * 1024).attach(kj::mv(response.body));
-}
-
-kj::Promise<void> LuaIoContext::kvDelete(size_t bindingIndex, kj::String key) {
-  kj::Url url;
-  url.scheme = kj::str("https");
-  url.host = kj::str("fake-host");
-  url.path.add(kj::mv(key));
-  url.query.add(kj::Url::QueryParam{kj::str("urlencoded"), kj::str("true")});
-  auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
-  kj::HttpHeaders headers(headerTable);
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str("lua.kv.delete")));
-  auto client = getKvHttpClient(bindingIndex, KvOperationType::DELETE, urlText, headers, tracing);
-  auto request =
-      attachToRequest(client->request(kj::HttpMethod::DELETE, urlText, headers, uint64_t(0)),
-          kj::Rc<kj::HttpClient>(kj::mv(client)));
-  auto response = co_await kj::mv(request.response);
-  KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
-      "Lua KV DELETE failed:", response.statusCode, response.statusText);
-  co_await response.body->readAllBytes(64 * 1024).attach(kj::mv(response.body));
-}
-
-kj::Promise<LuaKvListResponse> LuaIoContext::kvList(size_t bindingIndex, LuaKvListOptions options) {
-  kj::Url url;
-  url.scheme = kj::str("https");
-  url.host = kj::str("fake-host");
-  KJ_IF_SOME(limit, options.limit) {
-    if (limit > 0) {
-      url.query.add(kj::Url::QueryParam{kj::str("key_count_limit"), kj::str(limit)});
-    }
-  }
-  KJ_IF_SOME(prefix, options.prefix) {
-    url.query.add(kj::Url::QueryParam{kj::str("prefix"), kj::mv(prefix)});
-  }
-  KJ_IF_SOME(cursor, options.cursor) {
-    url.query.add(kj::Url::QueryParam{kj::str("cursor"), kj::mv(cursor)});
-  }
-  auto urlText = url.toString(kj::Url::Context::HTTP_PROXY_REQUEST);
-  kj::HttpHeaders headers(headerTable);
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str("lua.kv.list")));
-  auto client = getKvHttpClient(bindingIndex, KvOperationType::LIST, urlText, headers, tracing);
-  auto request = attachToRequest(client->request(kj::HttpMethod::GET, urlText, headers),
-      kj::Rc<kj::HttpClient>(kj::mv(client)));
-  auto response = co_await kj::mv(request.response);
-  KJ_REQUIRE(response.statusCode >= 200 && response.statusCode < 300,
-      "Lua KV LIST failed:", response.statusCode, response.statusText);
-  kj::Maybe<kj::String> cacheStatus;
-  KJ_IF_SOME(headerId, headerTable.stringToId("cf-cache-status")) {
-    cacheStatus =
-        response.headers->get(headerId).map([](kj::StringPtr value) { return kj::str(value); });
-  }
-  co_return LuaKvListResponse{.body = kj::mv(response.body), .cacheStatus = kj::mv(cacheStatus)};
-}
-
-kj::Promise<LuaHttpResponse> LuaIoContext::fetch(LuaHttpRequest request) {
-  kj::HttpMethod method = kj::HttpMethod::GET;
-  KJ_IF_SOME(parsedMethod, kj::tryParseHttpMethod(request.method)) {
-    method = parsedMethod;
-  } else {
-    KJ_FAIL_REQUIRE("workerd.fetch() has an unsupported HTTP method", request.method);
-  }
-  bool hasInboundBodyStream = request.bodyStreamRequestId != kj::none;
-  bool hasBodyProducer = request.bodyProducer != kj::none;
-  bool hasStreamingBody = hasInboundBodyStream || hasBodyProducer;
-  KJ_REQUIRE(!(hasInboundBodyStream && hasBodyProducer),
-      "workerd.fetch() request cannot have multiple streaming body sources");
-  KJ_REQUIRE(!hasStreamingBody || request.body.size() == 0,
-      "workerd.fetch() request cannot combine a string body with a streaming body source");
-  KJ_REQUIRE((method != kj::HttpMethod::GET && method != kj::HttpMethod::HEAD) ||
-          (request.body.size() == 0 && !hasStreamingBody),
-      "workerd.fetch() GET and HEAD requests cannot have a body");
-  KJ_REQUIRE(!hasInboundBodyStream || requestBodyStream != kj::none,
-      "workerd.fetch() request body stream is unavailable in this request");
-
-  kj::HttpHeaders headers(headerTable);
-  for (auto& header: request.headers) {
-    headers.addPtrPtr(header.name, header.value);
-  }
-  if (hasStreamingBody) {
-    KJ_IF_SOME(id, headerTable.stringToId("content-length")) headers.unset(id);
-    KJ_IF_SOME(id, headerTable.stringToId("transfer-encoding")) headers.unset(id);
-  }
-
-  KJ_IF_SOME(index, request.serviceBindingIndex) {
-    KJ_REQUIRE(index < serviceBindings.size(), "unknown Lua service binding index", index);
-  }
-  requestScope.checkSubrequest(SubrequestType::EXTERNAL);
-  auto tracing = TraceContextParent(parentSpan.addRef(), userSpanParent.addRef())
-                     .newChild(kj::ConstString(kj::str("lua.fetch")));
-  auto startRequest = [&]() {
-    KJ_IF_SOME(index, request.serviceBindingIndex) {
-      return serviceBindings[index]->startRequest(makeSubrequestMetadata(tracing));
-    }
-    return outbound.startRequest(makeSubrequestMetadata(tracing));
-  };
-  auto subrequest = requestScope.wrapSubrequestClient(startRequest(), CountSubrequest::YES);
-  auto client = asHttpClient(kj::mv(subrequest));
-  kj::Maybe<uint64_t> expectedBodySize = kj::none;
-  if (!hasStreamingBody) expectedBodySize = request.body.size();
-  auto outgoing = client->request(method, request.url, headers, expectedBodySize);
-  if (outgoing.body.get() != nullptr) {
-    if (hasInboundBodyStream) {
-      while (true) {
-        KJ_IF_SOME(chunk, co_await readRequestBody(LuaRuntime::MAX_HTTP_READ_CHUNK_BYTES)) {
-          co_await outgoing.body->write(chunk);
-        } else {
-          break;
-        }
-      }
-    } else KJ_IF_SOME(producer, request.bodyProducer) {
-      size_t bytesWritten = 0;
-      while (true) {
-        KJ_IF_SOME(chunk, co_await producer->nextChunk()) {
-          KJ_REQUIRE(chunk.size() <= LuaRuntime::MAX_HTTP_BODY_BYTES - bytesWritten,
-              "workerd.fetch() request body exceeds limit", LuaRuntime::MAX_HTTP_BODY_BYTES);
-          bytesWritten += chunk.size();
-          co_await outgoing.body->write(chunk);
-        } else {
-          break;
-        }
-      }
-    } else if (request.body.size() > 0) {
-      co_await outgoing.body->write(request.body);
-    }
-    outgoing.body = nullptr;
-  }
-
-  auto response = co_await kj::mv(outgoing.response);
-  KJ_REQUIRE(response.headers->size() <= LuaRuntime::MAX_HTTP_HEADERS,
-      "workerd.fetch() response has too many headers", LuaRuntime::MAX_HTTP_HEADERS);
-  kj::Vector<LuaRuntime::Header> responseHeaders;
-  response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
-    responseHeaders.add(LuaRuntime::Header{.name = kj::str(name), .value = kj::str(value)});
-  });
-  co_return LuaHttpResponse{
-    .status = static_cast<uint16_t>(response.statusCode),
-    .headers = kj::mv(responseHeaders),
-    .body = kj::mv(response.body),
-  };
-}
-
-LuaWorkerInterface::LuaWorkerInterface(LuaRuntime& runtime,
-    IoChannelFactory::SubrequestChannel& outbound,
-    const kj::HttpHeaderTable& headerTable,
-    IoChannelFactory::SubrequestMetadata metadata,
-    kj::EntropySource& entropySource,
-    kj::Own<SubrequestLimitPolicy> subrequestLimitPolicy,
-    kj::Own<workerd::RequestObserver> observer,
-    LuaRequestBodyMode requestBodyMode,
-    kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> serviceBindings,
-    kj::ArrayPtr<kj::Own<IoChannelFactory::SubrequestChannel>> kvBindings,
-    KvOperationLimitPolicy* kvOperationLimitPolicy)
-    : runtime(runtime),
-      hostOperations(outbound,
-          headerTable,
-          kj::mv(metadata),
-          entropySource,
-          kj::mv(subrequestLimitPolicy),
-          kj::mv(observer),
-          serviceBindings,
-          kvBindings,
-          kvOperationLimitPolicy),
-      requestBodyMode(requestBodyMode) {}
-
-kj::Promise<void> LuaWorkerInterface::request(kj::HttpMethod method,
-    kj::StringPtr url,
-    const kj::HttpHeaders& headers,
-    kj::AsyncInputStream& requestBody,
-    Response& response) {
-  if (headers.isWebSocket()) {
-    co_return co_await respondNotImplemented(response, headers, "WebSockets");
-  }
-
-  auto methodName = kj::str(method);
-  auto urlCopy = kj::str(url);
-  auto requestHeaders = headers.clone();
-  auto responseHeaders = requestHeaders.cloneShallow();
-  responseHeaders.clear();
-  kj::Maybe<LuaRuntime::Response> maybeResult = kj::none;
-  if (requestBodyMode == LuaRequestBodyMode::STREAMING) {
-    hostOperations.setRequestBodyStream(requestBody);
-    {
-      KJ_DEFER(hostOperations.clearRequestBodyStream());
-      maybeResult = co_await runtime.fetch(
-          methodName, urlCopy, requestHeaders, nullptr, hostOperations.getPtr(), requestBodyMode);
-    }
-  } else {
-    auto body = co_await requestBody.readAllBytes(LuaRuntime::MAX_HTTP_BODY_BYTES);
-    maybeResult = co_await runtime.fetch(
-        methodName, urlCopy, requestHeaders, body, hostOperations.getPtr(), requestBodyMode);
-  }
-  auto result = KJ_ASSERT_NONNULL(kj::mv(maybeResult));
-
-  for (auto& header: result.headers) {
-    responseHeaders.add(kj::mv(header.name), kj::mv(header.value));
-  }
-
-  auto output = response.send(result.status, "LuaJIT"_kj, responseHeaders, result.body.size());
-  co_await output->write(result.body);
-}
-
-kj::Promise<void> LuaWorkerInterface::connect(kj::StringPtr host,
-    const kj::HttpHeaders& headers,
-    kj::AsyncIoStream& connection,
-    ConnectResponse& response,
-    kj::HttpConnectSettings settings) {
-  auto responseHeaders = headers.cloneShallow();
-  responseHeaders.clear();
-  auto output = response.reject(501, "Not Implemented"_kj, responseHeaders, uint64_t(0));
-  kj::ArrayPtr<const kj::byte> noBody = nullptr;
-  return output->write(noBody);
-}
-
-kj::Promise<void> LuaWorkerInterface::prewarm(kj::StringPtr url) {
-  return kj::READY_NOW;
-}
-
-kj::Promise<WorkerInterface::ScheduledResult> LuaWorkerInterface::runScheduled(
-    kj::Date scheduledTime, kj::StringPtr cron) {
-  KJ_FAIL_REQUIRE("LuaJIT workers do not support scheduled events");
-}
-
-kj::Promise<WorkerInterface::AlarmResult> LuaWorkerInterface::runAlarm(
-    kj::Date scheduledTime, uint32_t retryCount) {
-  KJ_FAIL_REQUIRE("LuaJIT workers do not support alarms");
-}
-
-kj::Promise<WorkerInterface::CustomEvent::Result> LuaWorkerInterface::customEvent(
-    kj::Own<WorkerInterface::CustomEvent> event) {
-  return event->notSupported();
 }
 
 }  // namespace workerd::rt::luajit
